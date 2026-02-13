@@ -6,6 +6,7 @@ Handles GitHub webhooks and exposes a health-check endpoint.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -24,7 +25,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import get_settings
 from app.database import _get_session_factory
-from app.models import PRScan, Repository, Verdict
+from app.models import PRScan, Repository, User, Verdict
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -401,12 +402,36 @@ async def _github_list_repositories(token: str) -> list[dict[str, Any]]:
     for repo in repos:
         normalized.append(
             {
+                "id": repo.get("id"),
                 "full_name": repo.get("full_name", ""),
                 "private": bool(repo.get("private", False)),
                 "admin": bool(repo.get("permissions", {}).get("admin", False)),
             }
         )
     return normalized
+
+
+async def _github_get_repository(token: str, repo_full_name: str) -> dict[str, Any]:
+    """Fetch one repository by full name for id/visibility metadata."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient(timeout=12) as client:
+        resp = await client.get(f"{_GITHUB_API_BASE}/repos/{repo_full_name}", headers=headers)
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"GitHub repository lookup failed for {repo_full_name} "
+            f"({resp.status_code})."
+        )
+    repo = resp.json()
+    return {
+        "id": repo.get("id"),
+        "full_name": repo.get("full_name", repo_full_name),
+        "private": bool(repo.get("private", False)),
+        "admin": bool(repo.get("permissions", {}).get("admin", False)),
+    }
 
 
 async def _ensure_repo_webhook(token: str, repo_full_name: str) -> str:
@@ -469,6 +494,177 @@ async def _ensure_repo_webhook(token: str, repo_full_name: str) -> str:
     return f"Repository {repo_full_name} is now authorized."
 
 
+async def _ensure_repo_webhooks(
+    token: str,
+    repo_full_names: list[str],
+) -> tuple[list[str], list[str]]:
+    """Create/update Sentinel webhook for multiple repositories."""
+    unique_repo_names = list(dict.fromkeys(name.strip() for name in repo_full_names if name.strip()))
+    if not unique_repo_names:
+        return [], []
+
+    tasks = [_ensure_repo_webhook(token, repo_name) for repo_name in unique_repo_names]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    succeeded: list[str] = []
+    failed: list[str] = []
+    for repo_name, result in zip(unique_repo_names, results):
+        if isinstance(result, Exception):
+            failed.append(f"{repo_name}: {result}")
+            continue
+        succeeded.append(repo_name)
+    return succeeded, failed
+
+
+def _parse_repo_names(raw: str) -> list[str]:
+    """Parse comma/newline-separated repository names in owner/repo format."""
+    if not raw:
+        return []
+    normalized: list[str] = []
+    for token in raw.replace(",", "\n").splitlines():
+        name = token.strip()
+        if not name or "/" not in name:
+            continue
+        normalized.append(name)
+    return list(dict.fromkeys(normalized))
+
+
+async def _upsert_oauth_user(
+    db: AsyncSession,
+    *,
+    github_user: dict[str, Any],
+    oauth_token: str,
+) -> int | None:
+    """Persist GitHub OAuth user to support multi-user repository ownership."""
+    github_user_id = _coerce_int(github_user.get("id"))
+    github_login = str(github_user.get("login") or "").strip()
+    if github_user_id is None or not github_login:
+        return None
+
+    result = await db.execute(
+        select(User).where(User.github_user_id == github_user_id)
+    )
+    row = result.scalar_one_or_none()
+    if row:
+        row.github_login = github_login
+        row.access_token_encrypted = oauth_token
+        row.is_active = True
+        return int(row.id)
+
+    new_row = User(
+        github_user_id=github_user_id,
+        github_login=github_login,
+        access_token_encrypted=oauth_token,
+        is_active=True,
+    )
+    db.add(new_row)
+    await db.flush()
+    return int(new_row.id)
+
+
+async def _link_owner_to_repositories(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    repo_full_names: list[str],
+) -> int:
+    """Attach owner user to repository rows that already exist in DB."""
+    if not repo_full_names:
+        return 0
+    result = await db.execute(
+        select(Repository).where(Repository.full_name.in_(repo_full_names))
+    )
+    rows = result.scalars().all()
+    for row in rows:
+        row.owner_user_id = owner_user_id
+        row.is_active = True
+    return len(rows)
+
+
+async def _upsert_user_repositories(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    repositories: list[dict[str, Any]],
+) -> tuple[int, int]:
+    """Persist repository records for a user from OAuth-selected repo metadata."""
+    valid_repositories: list[tuple[int, str]] = []
+    for repo in repositories:
+        github_repo_id = _coerce_int(repo.get("id"))
+        full_name = str(repo.get("full_name") or "").strip()
+        if github_repo_id is None or not full_name:
+            continue
+        valid_repositories.append((github_repo_id, full_name))
+
+    if not valid_repositories:
+        return 0, 0
+
+    repo_ids = [repo_id for repo_id, _ in valid_repositories]
+    result = await db.execute(
+        select(Repository).where(Repository.github_repo_id.in_(repo_ids))
+    )
+    existing = {row.github_repo_id: row for row in result.scalars().all()}
+
+    created = 0
+    updated = 0
+    for github_repo_id, full_name in valid_repositories:
+        row = existing.get(github_repo_id)
+        if row:
+            row.full_name = full_name
+            row.owner_user_id = owner_user_id
+            row.is_active = True
+            if row.installation_id is None:
+                row.installation_id = 0
+            updated += 1
+            continue
+
+        db.add(
+            Repository(
+                github_repo_id=github_repo_id,
+                full_name=full_name,
+                installation_id=0,
+                owner_user_id=owner_user_id,
+                is_active=True,
+            )
+        )
+        created += 1
+    return created, updated
+
+
+def _render_scan_rows(
+    rows: list[dict[str, Any]],
+    *,
+    empty_message: str,
+) -> str:
+    if not rows:
+        return f"<div class='muted'>{escape(empty_message)}</div>"
+
+    body_rows: list[str] = []
+    for row in rows:
+        title = str(row.get("pr_title", ""))
+        repo = str(row.get("repo_full_name", ""))
+        pr_number = row.get("pr_number", "")
+        verdict = str(row.get("verdict", "")).lower()
+        url = str(row.get("pr_url", ""))
+        reason = str(row.get("analysis", {}).get("verdict_reason") or "")
+        body_rows.append(
+            "<tr>"
+            f"<td>{escape(repo)} #{escape(str(pr_number))}</td>"
+            f"<td><a href='{escape(url)}' target='_blank' rel='noreferrer'>{escape(title)}</a></td>"
+            f"<td>{escape(verdict)}</td>"
+            f"<td>{escape(reason[:90])}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='table-wrap'>"
+        "<table>"
+        "<thead><tr><th>PR</th><th>Title</th><th>Verdict</th><th>Reason</th></tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
 def _render_authorization_ui(
     *,
     oauth_enabled: bool,
@@ -476,45 +672,58 @@ def _render_authorization_ui(
     repositories: list[dict[str, Any]],
     flash_level: str | None,
     flash_message: str | None,
+    repo_name_prefill: str,
+    dashboard_stats: dict[str, int] | None,
+    pending_rows: list[dict[str, Any]],
+    reviewed_rows: list[dict[str, Any]],
+    spam_rows: list[dict[str, Any]],
+    connected_users: list[dict[str, Any]],
+    managed_repositories: list[dict[str, Any]],
 ) -> str:
     notice_html = ""
     if flash_message:
         cls = "ok" if flash_level == "success" else "err"
         notice_html = f"<div class='notice {cls}'>{escape(flash_message)}</div>"
 
-    repos_html = ""
-    if github_login:
-        if repositories:
-            options = []
-            for repo in repositories:
-                visibility = "private" if repo.get("private") else "public"
-                admin_tag = "admin" if repo.get("admin") else "collaborator"
-                full_name = str(repo.get("full_name", ""))
-                label = f"{full_name} · {visibility} · {admin_tag}"
-                options.append(
-                    f"<option value='{escape(full_name)}'>{escape(label)}</option>"
-                )
-            repos_html = (
-                "<form method='post' action='/ui/authorize-repo' class='stack'>"
-                "<label for='repo_full_name'>Choose Repository</label>"
-                "<select id='repo_full_name' name='repo_full_name' required>"
-                f"{''.join(options)}"
-                "</select>"
-                "<button type='submit'>Authorize Repository</button>"
-                "</form>"
+    options: list[str] = []
+    if repositories:
+        for repo in repositories:
+            visibility = "private" if repo.get("private") else "public"
+            admin_tag = "admin" if repo.get("admin") else "collaborator"
+            full_name = str(repo.get("full_name", ""))
+            label = f"{full_name} · {visibility} · {admin_tag}"
+            options.append(
+                f"<option value='{escape(full_name)}'>{escape(label)}</option>"
             )
-        else:
-            repos_html = (
-                "<div class='muted'>No repositories visible yet. "
-                "Try reconnecting GitHub or verify token scopes.</div>"
-            )
+    select_disabled = " disabled" if not github_login else ""
+    button_disabled = " disabled" if not github_login else ""
+    hint = (
+        "Connect GitHub first to authorize repositories."
+        if not github_login
+        else "You can submit multiple repositories at once."
+    )
+    repos_html = (
+        "<form method='post' action='/ui/authorize-repos' class='stack'>"
+        "<label for='repo_full_names'>Repository Names (owner/repo)</label>"
+        "<textarea id='repo_full_names' name='repo_full_names' rows='4' "
+        "placeholder='owner/repo-a&#10;owner/repo-b'>"
+        f"{escape(repo_name_prefill)}"
+        "</textarea>"
+        "<label for='repo_full_name_list'>Or select from connected repositories</label>"
+        f"<select id='repo_full_name_list' name='repo_full_name_list' multiple size='8'{select_disabled}>"
+        f"{''.join(options)}"
+        "</select>"
+        f"<div class='muted'>{escape(hint)}</div>"
+        f"<button type='submit'{button_disabled}>Authorize Repositories</button>"
+        "</form>"
+    )
 
     connect_html = ""
     if not oauth_enabled:
         connect_html = (
             "<div class='notice err'>Set <code>GITHUB_OAUTH_CLIENT_ID</code> and "
             "<code>GITHUB_OAUTH_CLIENT_SECRET</code> in <code>.env</code> to enable "
-            "repository authorization UI.</div>"
+            "multi-user repository authorization UI.</div>"
         )
     elif github_login:
         connect_html = (
@@ -528,12 +737,80 @@ def _render_authorization_ui(
             "<a class='oauth-btn' href='/auth/github/start'>Connect GitHub</a>"
         )
 
+    stats_html = ""
+    if dashboard_stats:
+        stats_html = (
+            "<section class='hero stats-hero'>"
+            "<h2>PR Overview</h2>"
+            "<div class='stats-grid'>"
+            f"<div class='stat'><span>Pending</span><strong>{dashboard_stats.get('queue_pending', 0)}</strong></div>"
+            f"<div class='stat'><span>Under Review</span><strong>{dashboard_stats.get('reviewed_approved', 0)}</strong></div>"
+            f"<div class='stat'><span>Spam / Closed</span><strong>{dashboard_stats.get('spam_closed', 0)}</strong></div>"
+            f"<div class='stat'><span>Repositories</span><strong>{dashboard_stats.get('total_repositories', 0)}</strong></div>"
+            f"<div class='stat'><span>Active Repos</span><strong>{dashboard_stats.get('active_repositories', 0)}</strong></div>"
+            f"<div class='stat'><span>Total Scans</span><strong>{dashboard_stats.get('total_scans', 0)}</strong></div>"
+            "</div>"
+            "</section>"
+        )
+
+    users_html = (
+        "<div class='muted'>No connected users yet.</div>"
+        if not connected_users
+        else (
+            "<div class='table-wrap'><table>"
+            "<thead><tr><th>GitHub Login</th><th>GitHub ID</th><th>Status</th></tr></thead>"
+            "<tbody>"
+            + "".join(
+                "<tr>"
+                f"<td>{escape(str(user.get('github_login', '')))}</td>"
+                f"<td>{escape(str(user.get('github_user_id', '')))}</td>"
+                f"<td>{'active' if user.get('is_active') else 'inactive'}</td>"
+                "</tr>"
+                for user in connected_users
+            )
+            + "</tbody></table></div>"
+        )
+    )
+
+    repos_html_table = (
+        "<div class='muted'>No repositories stored yet.</div>"
+        if not managed_repositories
+        else (
+            "<div class='table-wrap'><table>"
+            "<thead><tr><th>Repository</th><th>Owner User ID</th><th>Installation</th><th>Status</th></tr></thead>"
+            "<tbody>"
+            + "".join(
+                "<tr>"
+                f"<td>{escape(str(repo.get('full_name', '')))}</td>"
+                f"<td>{escape(str(repo.get('owner_user_id') or '-'))}</td>"
+                f"<td>{escape(str(repo.get('installation_id') or 0))}</td>"
+                f"<td>{'active' if repo.get('is_active') else 'inactive'}</td>"
+                "</tr>"
+                for repo in managed_repositories
+            )
+            + "</tbody></table></div>"
+        )
+    )
+
+    pending_html = _render_scan_rows(
+        pending_rows,
+        empty_message="No pending PRs currently in queue.",
+    )
+    reviewed_html = _render_scan_rows(
+        reviewed_rows,
+        empty_message="No reviewed PRs yet.",
+    )
+    spam_html = _render_scan_rows(
+        spam_rows,
+        empty_message="No spam/closed PRs yet.",
+    )
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Sentinel Repository Authorization</title>
+  <title>Sentinel Multi-Repo Authorization</title>
   <style>
     :root {{
       --bg: #f7efe1;
@@ -610,6 +887,10 @@ def _render_authorization_ui(
       font-weight: 600;
       cursor: pointer;
     }}
+    button:disabled {{
+      opacity: 0.55;
+      cursor: not-allowed;
+    }}
     button.secondary {{
       background: #334155;
     }}
@@ -621,7 +902,16 @@ def _render_authorization_ui(
       border: 1px solid var(--border);
       background: #fff;
       color: var(--ink);
-      min-height: 42px;
+      min-height: 46px;
+    }}
+    textarea {{
+      padding: 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: #fff;
+      color: var(--ink);
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      line-height: 1.4;
     }}
     .row {{
       display: flex;
@@ -636,29 +926,108 @@ def _render_authorization_ui(
       padding: 2px 5px;
       border-radius: 6px;
     }}
+    .stats-hero {{ margin-top: 16px; }}
+    .stats-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }}
+    .stat {{
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }}
+    .stat span {{
+      color: var(--muted);
+      font-size: 0.85rem;
+    }}
+    .stat strong {{
+      font-size: 1.2rem;
+    }}
+    .panes {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 16px;
+    }}
+    .table-wrap {{
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 540px;
+    }}
+    th, td {{
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid #ece7de;
+      vertical-align: top;
+      font-size: 0.9rem;
+    }}
+    th {{
+      background: #fbf5ea;
+      color: var(--muted);
+      font-weight: 700;
+    }}
+    .full {{ grid-column: 1 / -1; }}
     @media (max-width: 760px) {{
       .grid {{ grid-template-columns: 1fr; }}
+      .stats-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .panes {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
 <body>
   <main class="wrap">
     <section class="hero">
-      <h1>Sentinel Repository Authorization</h1>
-      <p>Connect GitHub, select a repository, and authorize Sentinel by creating or updating a <code>pull_request</code> webhook pointing to this service.</p>
+      <h1>Sentinel Multi-User Repository Authorization</h1>
+      <p>Connect GitHub, provide repository names (or select multiple repos), and authorize Sentinel webhooks in one step for multi-user/multi-repo setup.</p>
       {notice_html}
       <div class="grid">
         <article class="card">
-          <h2>1. Connect Account</h2>
+          <h2>1. GitHub Configuration</h2>
           <p class="muted">OAuth scopes requested: <code>repo</code> and <code>read:user</code>.</p>
+          <p class="muted">Webhook target: <code>{escape(settings.public_base_url.rstrip('/'))}/webhook</code></p>
+          <p class="muted">Webhook events: <code>pull_request</code>, <code>installation</code>, <code>installation_repositories</code></p>
           {connect_html}
         </article>
         <article class="card">
-          <h2>2. Authorize Repository</h2>
-          <p class="muted">Sentinel will configure webhook target: <code>{escape(settings.public_base_url.rstrip('/'))}/webhook</code></p>
+          <h2>2. Repositories</h2>
+          <p class="muted">Authorize one or many repositories in a single submit.</p>
           {repos_html}
         </article>
       </div>
+    </section>
+    {stats_html}
+    <section class="panes">
+      <article class="card">
+        <h2>Pending Queue</h2>
+        {pending_html}
+      </article>
+      <article class="card">
+        <h2>Under Review</h2>
+        {reviewed_html}
+      </article>
+      <article class="card full">
+        <h2>Spam / Closed</h2>
+        {spam_html}
+      </article>
+      <article class="card">
+        <h2>Connected GitHub Users</h2>
+        {users_html}
+      </article>
+      <article class="card">
+        <h2>Managed Repositories</h2>
+        {repos_html_table}
+      </article>
     </section>
   </main>
 </body>
@@ -678,7 +1047,14 @@ async def ui_home(request: Request):
     flash_level, flash_message = _pop_flash(request)
     github_login = request.session.get("github_user_login")
     oauth_token = request.session.get("github_oauth_token")
+    repo_name_prefill = str(request.session.get("ui_repo_name_prefill", ""))
     repositories: list[dict[str, Any]] = []
+    dashboard_stats: dict[str, int] | None = None
+    pending_rows: list[dict[str, Any]] = []
+    reviewed_rows: list[dict[str, Any]] = []
+    spam_rows: list[dict[str, Any]] = []
+    connected_users: list[dict[str, Any]] = []
+    managed_repositories: list[dict[str, Any]] = []
 
     if oauth_token:
         try:
@@ -686,11 +1062,112 @@ async def ui_home(request: Request):
         except Exception as exc:
             request.session.pop("github_oauth_token", None)
             request.session.pop("github_user_login", None)
+            request.session.pop("github_user_id", None)
+            request.session.pop("sentinel_user_id", None)
             flash_level = "error"
             flash_message = (
                 "Connected GitHub session expired or failed. "
                 f"Please reconnect. ({exc})"
             )
+
+    if settings.supabase_uses_postgres:
+        try:
+            async with _dashboard_db_session() as db:
+                verdict_counts_stmt = (
+                    select(PRScan.verdict, func.count(PRScan.id))
+                    .group_by(PRScan.verdict)
+                )
+                verdict_rows = (await db.execute(verdict_counts_stmt)).all()
+                verdict_counts: dict[str, int] = {}
+                for verdict, count in verdict_rows:
+                    value = verdict.value if isinstance(verdict, Verdict) else str(verdict)
+                    verdict_counts[value] = int(count)
+
+                pending = verdict_counts.get(Verdict.PENDING.value, 0)
+                reviewed = verdict_counts.get(Verdict.PASSED.value, 0)
+                failed = verdict_counts.get(Verdict.FAILED.value, 0)
+                soft_fail = verdict_counts.get(Verdict.SOFT_FAIL.value, 0)
+                total_scans = int((await db.scalar(select(func.count(PRScan.id)))) or 0)
+                total_repositories = int((await db.scalar(select(func.count(Repository.id)))) or 0)
+                active_repositories = int(
+                    (
+                        await db.scalar(
+                            select(func.count(Repository.id)).where(Repository.is_active.is_(True))
+                        )
+                    )
+                    or 0
+                )
+                dashboard_stats = {
+                    "queue_pending": pending,
+                    "reviewed_approved": reviewed,
+                    "spam_closed": failed + soft_fail,
+                    "auto_closed": failed,
+                    "needs_clarification": soft_fail,
+                    "total_scans": total_scans,
+                    "total_repositories": total_repositories,
+                    "active_repositories": active_repositories,
+                }
+
+                pending_scans = (
+                    await db.execute(
+                        select(PRScan)
+                        .where(PRScan.verdict == Verdict.PENDING)
+                        .order_by(PRScan.created_at.desc())
+                        .limit(8)
+                    )
+                ).scalars().all()
+                reviewed_scans = (
+                    await db.execute(
+                        select(PRScan)
+                        .where(PRScan.verdict == Verdict.PASSED)
+                        .order_by(PRScan.created_at.desc())
+                        .limit(8)
+                    )
+                ).scalars().all()
+                spam_scans = (
+                    await db.execute(
+                        select(PRScan)
+                        .where(PRScan.verdict.in_([Verdict.FAILED, Verdict.SOFT_FAIL]))
+                        .order_by(PRScan.created_at.desc())
+                        .limit(8)
+                    )
+                ).scalars().all()
+                pending_rows = [_scan_to_response(scan) for scan in pending_scans]
+                reviewed_rows = [_scan_to_response(scan) for scan in reviewed_scans]
+                spam_rows = [_scan_to_response(scan) for scan in spam_scans]
+
+                user_rows = (
+                    await db.execute(
+                        select(User).order_by(User.updated_at.desc()).limit(12)
+                    )
+                ).scalars().all()
+                connected_users = [
+                    {
+                        "github_user_id": int(row.github_user_id),
+                        "github_login": row.github_login,
+                        "is_active": bool(row.is_active),
+                    }
+                    for row in user_rows
+                ]
+
+                repo_rows = (
+                    await db.execute(
+                        select(Repository).order_by(Repository.updated_at.desc()).limit(20)
+                    )
+                ).scalars().all()
+                managed_repositories = [
+                    {
+                        "full_name": row.full_name,
+                        "owner_user_id": row.owner_user_id,
+                        "installation_id": int(row.installation_id),
+                        "is_active": bool(row.is_active),
+                    }
+                    for row in repo_rows
+                ]
+        except Exception as exc:
+            if not flash_message:
+                flash_level = "error"
+                flash_message = f"Could not load dashboard snapshot: {exc}"
 
     html = _render_authorization_ui(
         oauth_enabled=settings.github_oauth_enabled,
@@ -698,6 +1175,13 @@ async def ui_home(request: Request):
         repositories=repositories,
         flash_level=flash_level,
         flash_message=flash_message,
+        repo_name_prefill=repo_name_prefill,
+        dashboard_stats=dashboard_stats,
+        pending_rows=pending_rows,
+        reviewed_rows=reviewed_rows,
+        spam_rows=spam_rows,
+        connected_users=connected_users,
+        managed_repositories=managed_repositories,
     )
     return HTMLResponse(content=html)
 
@@ -742,7 +1226,23 @@ async def github_auth_callback(
         user = await _github_get_authenticated_user(token)
         request.session["github_oauth_token"] = token
         request.session["github_user_login"] = user.get("login", "unknown")
-        _set_flash(request, "success", "GitHub connected. Select a repository to authorize.")
+        request.session["github_user_id"] = str(user.get("id", ""))
+
+        if settings.supabase_uses_postgres:
+            async with _dashboard_db_session() as db:
+                sentinel_user_id = await _upsert_oauth_user(
+                    db,
+                    github_user=user,
+                    oauth_token=token,
+                )
+                if sentinel_user_id is not None:
+                    request.session["sentinel_user_id"] = str(sentinel_user_id)
+
+        _set_flash(
+            request,
+            "success",
+            "GitHub connected. Enter repository names or select multiple repositories to authorize.",
+        )
     except Exception as exc:
         _set_flash(request, "error", f"GitHub OAuth failed: {exc}")
 
@@ -753,30 +1253,109 @@ async def github_auth_callback(
 async def github_auth_logout(request: Request):
     request.session.pop("github_oauth_token", None)
     request.session.pop("github_user_login", None)
+    request.session.pop("github_user_id", None)
+    request.session.pop("sentinel_user_id", None)
     request.session.pop("github_oauth_state", None)
+    request.session.pop("ui_repo_name_prefill", None)
     _set_flash(request, "success", "GitHub account disconnected.")
     return RedirectResponse(url="/ui", status_code=302)
 
 
-@app.post("/ui/authorize-repo", include_in_schema=False)
-async def authorize_repository(request: Request):
+@app.post("/ui/authorize-repos", include_in_schema=False)
+async def authorize_repositories(request: Request):
     oauth_token = request.session.get("github_oauth_token")
     if not oauth_token:
         _set_flash(request, "error", "Connect GitHub before authorizing a repository.")
         return RedirectResponse(url="/ui", status_code=302)
 
     form = await request.form()
-    repo_full_name = str(form.get("repo_full_name", "")).strip()
-    if not repo_full_name or "/" not in repo_full_name:
-        _set_flash(request, "error", "Choose a valid repository in owner/name format.")
+    selected_repo_names = [str(v).strip() for v in form.getlist("repo_full_name_list")]
+    typed_repo_names = _parse_repo_names(str(form.get("repo_full_names", "")).strip())
+    repo_full_names = list(dict.fromkeys(
+        [name for name in (*selected_repo_names, *typed_repo_names) if name and "/" in name]
+    ))
+
+    request.session["ui_repo_name_prefill"] = "\n".join(typed_repo_names)
+
+    if not repo_full_names:
+        _set_flash(
+            request,
+            "error",
+            "Provide at least one repository in owner/name format or select from the list.",
+        )
         return RedirectResponse(url="/ui", status_code=302)
 
+    visible_repo_by_name: dict[str, dict[str, Any]] = {}
     try:
-        message = await _ensure_repo_webhook(str(oauth_token), repo_full_name)
-        _set_flash(request, "success", message)
+        visible_repositories = await _github_list_repositories(str(oauth_token))
+        visible_repo_by_name = {
+            str(repo.get("full_name", "")).strip(): repo for repo in visible_repositories
+        }
+    except Exception:
+        visible_repo_by_name = {}
+
+    try:
+        succeeded, failed = await _ensure_repo_webhooks(str(oauth_token), repo_full_names)
+        sentinel_user_id = _coerce_int(request.session.get("sentinel_user_id"))
+        linked_count = 0
+        created_repos = 0
+        updated_repos = 0
+        metadata_failures: list[str] = []
+        if settings.supabase_uses_postgres and sentinel_user_id is not None:
+            repositories_to_persist: list[dict[str, Any]] = []
+            for full_name in succeeded:
+                meta = visible_repo_by_name.get(full_name)
+                if meta is None:
+                    try:
+                        meta = await _github_get_repository(str(oauth_token), full_name)
+                    except Exception as exc:
+                        metadata_failures.append(f"{full_name}: {exc}")
+                        continue
+                repositories_to_persist.append(meta)
+
+            async with _dashboard_db_session() as db:
+                linked_count = await _link_owner_to_repositories(
+                    db,
+                    owner_user_id=sentinel_user_id,
+                    repo_full_names=succeeded,
+                )
+                created_repos, updated_repos = await _upsert_user_repositories(
+                    db,
+                    owner_user_id=sentinel_user_id,
+                    repositories=repositories_to_persist,
+                )
+
+        if failed or metadata_failures:
+            failed_preview = "; ".join((failed + metadata_failures)[:3])
+            _set_flash(
+                request,
+                "error",
+                (
+                    f"Authorized {len(succeeded)} repos, failed {len(failed) + len(metadata_failures)}. "
+                    f"Linked {linked_count} repos; persisted repo records "
+                    f"(created={created_repos}, updated={updated_repos}). "
+                    f"Failures: {failed_preview}"
+                ),
+            )
+        else:
+            _set_flash(
+                request,
+                "success",
+                (
+                    f"Authorized {len(succeeded)} repositories successfully. "
+                    f"Linked {linked_count} repos; persisted repo records "
+                    f"(created={created_repos}, updated={updated_repos})."
+                ),
+            )
     except Exception as exc:
-        _set_flash(request, "error", f"Authorization failed for {repo_full_name}: {exc}")
+        _set_flash(request, "error", f"Repository authorization failed: {exc}")
     return RedirectResponse(url="/ui", status_code=302)
+
+
+@app.post("/ui/authorize-repo", include_in_schema=False)
+async def authorize_repository_legacy(request: Request):
+    """Backward-compatible alias for older UI form action."""
+    return await authorize_repositories(request)
 
 
 @app.get("/api/dashboard/stats")
