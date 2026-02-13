@@ -22,6 +22,11 @@ def _get_engine():
     global _engine
     if _engine is None:
         settings = get_settings()
+        if not settings.supabase_uses_postgres:
+            raise RuntimeError(
+                "SUPABASE_URL is configured as HTTPS project URL. "
+                "SQLAlchemy engine requires PostgreSQL DSN mode."
+            )
         _engine = create_async_engine(
             settings.supabase_url,
             echo=False,

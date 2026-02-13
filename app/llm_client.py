@@ -112,6 +112,7 @@ class GroqClient:
         pr_body: str,
         issue_body: str,
         issue_title: str,
+        diff_text: str,
     ) -> dict[str, Any]:
         """Check whether a PR genuinely addresses the linked issue.
 
@@ -127,9 +128,11 @@ class GroqClient:
             Respond ONLY with JSON:
             {"aligned": <bool>, "score": <0.0-1.0>, "explanation": "<short>"}
         """)
+        excerpt = diff_text[:18_000]
         user = (
             f"## Issue\n**Title:** {issue_title}\n\n{issue_body}\n\n"
-            f"## Pull Request Body\n{pr_body}"
+            f"## Pull Request Body\n{pr_body}\n\n"
+            f"## Unified Diff\n{excerpt}"
         )
         return self._parse_json(self._chat(system, user))
 
@@ -177,3 +180,31 @@ class GroqClient:
             "summary": f"Analysed {len(chunks)} diff chunks. "
                        f"Average quality score: {avg_score:.2f}.",
         }
+
+    def check_intent_match(
+        self,
+        pr_title: str,
+        pr_body: str,
+        diff_text: str,
+    ) -> dict[str, Any]:
+        """Compare PR intent (title/body) vs actual diff content.
+
+        Returns
+        -------
+        dict  ``{matches: bool, score: float, explanation: str}``
+        """
+        system = textwrap.dedent("""\
+            You are Sentinel, an intent-verification reviewer.
+            Compare PR title/description with code changes and determine whether
+            the claimed intent actually matches the diff.
+
+            Respond ONLY with JSON:
+            {"matches": <bool>, "score": <0.0-1.0>, "explanation": "<short>"}
+        """)
+        excerpt = diff_text[:18_000]
+        user = (
+            f"## Pull Request Title\n{pr_title}\n\n"
+            f"## Pull Request Description\n{pr_body}\n\n"
+            f"## Unified Diff\n{excerpt}"
+        )
+        return self._parse_json(self._chat(system, user))
