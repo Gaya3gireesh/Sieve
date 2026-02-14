@@ -116,6 +116,8 @@ class Repository(Base):
     github_repo_id = Column(BigInteger, nullable=False, unique=True, index=True)
     full_name = Column(String(256), nullable=False, index=True)
     installation_id = Column(BigInteger, nullable=False, index=True)
+    webhook_id = Column(BigInteger, nullable=True, index=True)
+    webhook_secret_encrypted = Column(Text, nullable=True)
     is_active = Column(Boolean, nullable=False, default=True, index=True)
     created_at = Column(
         DateTime(timezone=True),

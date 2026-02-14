@@ -9,16 +9,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
+import json
 import logging
+import multiprocessing
 import secrets
 from contextlib import asynccontextmanager
 from html import escape
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.sessions import SessionMiddleware
@@ -40,11 +44,15 @@ async def lifespan(app: FastAPI):
     if settings.github_token_is_placeholder:
         logger.warning(
             "GITHUB_TOKEN looks like a placeholder. "
-            "Worker GitHub API calls will fail until a real token is set."
+            "Worker will rely on per-repository OAuth tokens from UI connections."
         )
     logger.info(
         "Supabase mode: %s",
         "postgres" if settings.supabase_uses_postgres else "rest",
+    )
+    logger.info(
+        "Processing mode: %s",
+        "celery-worker" if settings.use_celery_worker else "inline",
     )
     logger.info("Sentinel is online 🛡️")
     yield
@@ -70,39 +78,124 @@ app.add_middleware(
 # ── Lazy worker import ──────────────────────────────────────────────────────
 
 
-def _enqueue_pr(payload: dict[str, Any]) -> str:
-    """Lazily import the Celery task and enqueue a PR for processing.
-
-    This avoids importing worker.py (which creates a Celery app and
-    GroqClient) at module-load time, so FastAPI can start even if
-    Redis / Groq are temporarily unreachable.
-    """
+def _process_pr_inline(payload: dict[str, Any], task_id: str) -> None:
+    """Run PR pipeline in-process (no separate Celery worker required)."""
     from app.worker import process_pr
 
-    task = process_pr.delay(payload)
-    return task.id
+    try:
+        process_pr.run(payload)
+        logger.info(
+            "Inline processed PR %s#%s → task %s",
+            payload.get("repository", {}).get("full_name", "?"),
+            payload.get("pull_request", {}).get("number", "?"),
+            task_id,
+        )
+    except Exception:
+        logger.exception("Inline PR processing failed for task %s", task_id)
+
+
+def _spawn_inline_pr_process(payload: dict[str, Any], task_id: str) -> None:
+    """Run one PR scan in a separate process to isolate async DB loops."""
+    proc = multiprocessing.Process(
+        target=_process_pr_inline,
+        args=(payload, task_id),
+        daemon=True,
+    )
+    proc.start()
+
+
+def _enqueue_pr(payload: dict[str, Any]) -> str:
+    """Enqueue PR processing using Celery or inline background mode."""
+    if settings.use_celery_worker:
+        from app.worker import process_pr
+
+        task = process_pr.delay(payload)
+        return task.id
+
+    task_id = secrets.token_urlsafe(12)
+    _spawn_inline_pr_process(payload, task_id)
+    return task_id
 
 
 # ── Signature verification ──────────────────────────────────────────────────
 
 
-def _verify_signature(payload_body: bytes, signature: str | None) -> None:
-    """Verify the GitHub HMAC-SHA256 webhook signature."""
+async def _repository_webhook_secret_from_payload(payload: dict[str, Any]) -> str | None:
+    """Resolve per-repository webhook secret from DB using payload metadata."""
+    repo_raw = payload.get("repository")
+    if not isinstance(repo_raw, dict):
+        return None
+
+    repo_id = _coerce_int(repo_raw.get("id"))
+    full_name = str(repo_raw.get("full_name") or "").strip()
+    if repo_id is None and not full_name:
+        return None
+    if not settings.supabase_uses_postgres:
+        return None
+
+    factory = _get_session_factory()
+    async with factory() as session:
+        row = None
+        if repo_id is not None:
+            row = (
+                await session.execute(
+                    select(Repository).where(Repository.github_repo_id == repo_id)
+                )
+            ).scalar_one_or_none()
+        if row is None and full_name:
+            row = (
+                await session.execute(
+                    select(Repository).where(Repository.full_name == full_name)
+                )
+            ).scalar_one_or_none()
+        if row is None:
+            return None
+
+        secret = str(row.webhook_secret_encrypted or "").strip()
+        return secret or None
+
+
+async def _verify_signature(
+    payload_body: bytes,
+    signature: str | None,
+    payload: dict[str, Any],
+) -> None:
+    """Verify webhook signature using repository secret first, then global fallback."""
     if not signature:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Missing X-Hub-Signature-256 header.",
         )
-    expected = "sha256=" + hmac.new(
-        settings.github_webhook_secret.encode(),
-        payload_body,
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(expected, signature):
+
+    candidates: list[str] = []
+    repo_secret = await _repository_webhook_secret_from_payload(payload)
+    if repo_secret:
+        candidates.append(repo_secret)
+    if settings.github_webhook_secret_configured:
+        candidates.append(settings.github_webhook_secret.strip())
+
+    if not candidates:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid webhook signature.",
+            detail=(
+                "No webhook secret configured for this repository. "
+                "Authorize the repository from UI first."
+            ),
         )
+
+    for candidate in candidates:
+        expected = "sha256=" + hmac.new(
+            candidate.encode(),
+            payload_body,
+            hashlib.sha256,
+        ).hexdigest()
+        if hmac.compare_digest(expected, signature):
+            return
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Invalid webhook signature.",
+    )
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -270,6 +363,23 @@ async def _dashboard_db_session():
             await session.close()
 
 
+async def _active_oauth_user_count() -> int:
+    """Count active users with stored GitHub OAuth tokens."""
+    if not settings.supabase_uses_postgres:
+        return 0
+    try:
+        async with _dashboard_db_session() as db:
+            stmt = select(func.count(User.id)).where(
+                User.is_active.is_(True),
+                User.access_token_encrypted.is_not(None),
+                User.access_token_encrypted != "",
+            )
+            return int((await db.scalar(stmt)) or 0)
+    except Exception:
+        logger.exception("Could not count active OAuth users.")
+        return 0
+
+
 def _scan_bucket(verdict: Verdict | str) -> str:
     """Map PR verdicts to dashboard tabs."""
     value = verdict.value if isinstance(verdict, Verdict) else str(verdict)
@@ -327,6 +437,7 @@ def _scan_to_response(scan: PRScan) -> dict[str, Any]:
 _GITHUB_OAUTH_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
 _GITHUB_OAUTH_TOKEN_URL = "https://github.com/login/oauth/access_token"
 _GITHUB_API_BASE = "https://api.github.com"
+_DEV_DEFAULT_PUBLIC_BASE_URL = "http://127.0.0.1:8000"
 
 
 def _set_flash(request: Request, level: str, message: str) -> None:
@@ -340,8 +451,43 @@ def _pop_flash(request: Request) -> tuple[str | None, str | None]:
     return value.get("level"), value.get("message")
 
 
-def _github_oauth_redirect_uri() -> str:
-    return f"{settings.public_base_url.rstrip('/')}/auth/github/callback"
+def _effective_public_base_url(request: Request | None = None) -> str:
+    """Resolve base URL used for OAuth redirect + webhook target.
+
+    If PUBLIC_BASE_URL remains the default dev value, use the current request
+    host/port so local runs on non-8000 ports keep working.
+    """
+    configured = settings.public_base_url.strip().rstrip("/")
+    if request is not None and (
+        not configured or configured == _DEV_DEFAULT_PUBLIC_BASE_URL
+    ):
+        return str(request.base_url).rstrip("/")
+    return configured or _DEV_DEFAULT_PUBLIC_BASE_URL
+
+
+def _github_oauth_redirect_uri(request: Request | None = None) -> str:
+    return f"{_effective_public_base_url(request)}/auth/github/callback"
+
+
+def _webhook_target_url(public_base_url: str) -> str:
+    return f"{public_base_url.rstrip('/')}/webhook"
+
+
+def _is_public_https_base_url(public_base_url: str) -> bool:
+    """Whether GitHub can realistically reach this webhook base URL."""
+    parsed = urlparse(public_base_url)
+    if parsed.scheme != "https":
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    if host in {"localhost", "127.0.0.1", "0.0.0.0"}:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local)
 
 
 async def _github_exchange_oauth_code(code: str) -> str:
@@ -434,8 +580,73 @@ async def _github_get_repository(token: str, repo_full_name: str) -> dict[str, A
     }
 
 
-async def _ensure_repo_webhook(token: str, repo_full_name: str) -> str:
-    webhook_target = f"{settings.public_base_url.rstrip('/')}/webhook"
+def _build_pull_request_event_payload(
+    repo_full_name: str,
+    pull_request: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Build a minimal pull_request webhook-like payload for queue ingestion."""
+    pr_number = _coerce_int(pull_request.get("number"))
+    if pr_number is None:
+        return None
+
+    user = pull_request.get("user") if isinstance(pull_request.get("user"), dict) else {}
+    return {
+        "action": "opened",
+        "repository": {"full_name": repo_full_name},
+        "pull_request": {
+            "number": pr_number,
+            "title": str(pull_request.get("title") or ""),
+            "body": str(pull_request.get("body") or ""),
+            "html_url": str(pull_request.get("html_url") or ""),
+            "user": {
+                "login": str(user.get("login") or "unknown"),
+                "created_at": str(user.get("created_at") or ""),
+            },
+        },
+    }
+
+
+async def _github_list_open_pull_requests(
+    token: str,
+    repo_full_name: str,
+    *,
+    limit: int = 25,
+) -> list[dict[str, Any]]:
+    """List open PRs for one repository using the OAuth session token."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    params = {
+        "state": "open",
+        "sort": "updated",
+        "direction": "desc",
+        "per_page": max(1, min(limit, 100)),
+    }
+    async with httpx.AsyncClient(timeout=12) as client:
+        resp = await client.get(
+            f"{_GITHUB_API_BASE}/repos/{repo_full_name}/pulls",
+            headers=headers,
+            params=params,
+        )
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"Could not list open PRs for {repo_full_name} ({resp.status_code})."
+        )
+    rows = resp.json()
+    if not isinstance(rows, list):
+        return []
+    return rows
+
+
+async def _ensure_repo_webhook(
+    token: str,
+    repo_full_name: str,
+    *,
+    webhook_target: str,
+    webhook_secret: str,
+) -> dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -444,7 +655,7 @@ async def _ensure_repo_webhook(token: str, repo_full_name: str) -> str:
     hook_config = {
         "url": webhook_target,
         "content_type": "json",
-        "secret": settings.github_webhook_secret,
+        "secret": webhook_secret,
         "insecure_ssl": "0",
     }
     hook_payload = {"name": "web", "active": True, "events": ["pull_request"], "config": hook_config}
@@ -479,8 +690,20 @@ async def _ensure_repo_webhook(token: str, repo_full_name: str) -> str:
                     raise RuntimeError(
                         f"Webhook update failed ({patch_resp.status_code})."
                     )
-                return f"Repository {repo_full_name} is now authorized (webhook updated)."
-            return f"Repository {repo_full_name} is already authorized."
+                body = patch_resp.json()
+                hook_id = _coerce_int(body.get("id")) or _coerce_int(hook_id)
+                return {
+                    "repo_full_name": repo_full_name,
+                    "hook_id": hook_id,
+                    "webhook_secret": webhook_secret,
+                    "message": f"Repository {repo_full_name} is now authorized (webhook updated).",
+                }
+            return {
+                "repo_full_name": repo_full_name,
+                "hook_id": None,
+                "webhook_secret": webhook_secret,
+                "message": f"Repository {repo_full_name} is already authorized.",
+            }
 
         create_resp = await client.post(
             f"{_GITHUB_API_BASE}/repos/{repo_full_name}/hooks",
@@ -491,29 +714,125 @@ async def _ensure_repo_webhook(token: str, repo_full_name: str) -> str:
             raise RuntimeError(
                 f"Webhook creation failed ({create_resp.status_code}): {create_resp.text[:180]}"
             )
-    return f"Repository {repo_full_name} is now authorized."
+        created = create_resp.json()
+    return {
+        "repo_full_name": repo_full_name,
+        "hook_id": _coerce_int(created.get("id")),
+        "webhook_secret": webhook_secret,
+        "message": f"Repository {repo_full_name} is now authorized.",
+    }
 
 
 async def _ensure_repo_webhooks(
     token: str,
     repo_full_names: list[str],
-) -> tuple[list[str], list[str]]:
+    *,
+    webhook_target: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Create/update Sentinel webhook for multiple repositories."""
     unique_repo_names = list(dict.fromkeys(name.strip() for name in repo_full_names if name.strip()))
     if not unique_repo_names:
         return [], []
 
-    tasks = [_ensure_repo_webhook(token, repo_name) for repo_name in unique_repo_names]
+    tasks = []
+    for repo_name in unique_repo_names:
+        repo_secret = secrets.token_urlsafe(48)
+        tasks.append(
+            _ensure_repo_webhook(
+                token,
+                repo_name,
+                webhook_target=webhook_target,
+                webhook_secret=repo_secret,
+            )
+        )
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    succeeded: list[str] = []
+    succeeded: list[dict[str, Any]] = []
     failed: list[str] = []
     for repo_name, result in zip(unique_repo_names, results):
         if isinstance(result, Exception):
             failed.append(f"{repo_name}: {result}")
             continue
-        succeeded.append(repo_name)
+        succeeded.append(result)
     return succeeded, failed
+
+
+async def _existing_pending_pr_numbers(
+    db: AsyncSession,
+    *,
+    repo_full_name: str,
+    pr_numbers: list[int],
+) -> set[int]:
+    """Return PR numbers that already exist in pending state for one repo."""
+    if not pr_numbers:
+        return set()
+    result = await db.execute(
+        select(PRScan.pr_number).where(
+            PRScan.repo_full_name == repo_full_name,
+            PRScan.pr_number.in_(pr_numbers),
+            PRScan.verdict == Verdict.PENDING,
+        )
+    )
+    return {int(value) for value in result.scalars().all() if value is not None}
+
+
+async def _sync_open_prs_for_repositories(
+    token: str,
+    repo_full_names: list[str],
+) -> tuple[int, int, int, list[str]]:
+    """Fetch open PRs for repositories and enqueue missing scans."""
+    unique_repo_names = list(dict.fromkeys(name.strip() for name in repo_full_names if name.strip()))
+    if not unique_repo_names:
+        return 0, 0, 0, []
+
+    fetched = 0
+    queued = 0
+    skipped = 0
+    failures: list[str] = []
+
+    for repo_name in unique_repo_names:
+        try:
+            open_prs = await _github_list_open_pull_requests(token, repo_name, limit=25)
+        except Exception as exc:
+            failures.append(f"{repo_name}: {exc}")
+            continue
+
+        fetched += len(open_prs)
+        numbers = [
+            number
+            for number in (_coerce_int(pr.get("number")) for pr in open_prs)
+            if number is not None
+        ]
+        pending_numbers: set[int] = set()
+        if settings.supabase_uses_postgres and numbers:
+            try:
+                async with _dashboard_db_session() as db:
+                    pending_numbers = await _existing_pending_pr_numbers(
+                        db,
+                        repo_full_name=repo_name,
+                        pr_numbers=numbers,
+                    )
+            except Exception as exc:
+                failures.append(f"{repo_name}: pending-check failed ({exc})")
+
+        for pr in open_prs:
+            number = _coerce_int(pr.get("number"))
+            if number is None:
+                continue
+            if number in pending_numbers:
+                skipped += 1
+                continue
+
+            payload = _build_pull_request_event_payload(repo_name, pr)
+            if payload is None:
+                continue
+            try:
+                _enqueue_pr(payload)
+                queued += 1
+            except Exception as exc:
+                failures.append(f"{repo_name}#{number}: enqueue failed ({exc})")
+
+    return fetched, queued, skipped, failures
 
 
 def _parse_repo_names(raw: str) -> list[str]:
@@ -527,6 +846,43 @@ def _parse_repo_names(raw: str) -> list[str]:
             continue
         normalized.append(name)
     return list(dict.fromkeys(normalized))
+
+
+def _normalize_repo_names(raw: str | list[str]) -> list[str]:
+    """Normalize repo names from textarea/list payloads."""
+    if isinstance(raw, str):
+        return _parse_repo_names(raw)
+
+    normalized: list[str] = []
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        normalized.extend(_parse_repo_names(value))
+    return list(dict.fromkeys(normalized))
+
+
+def _safe_next_redirect_url(value: str | None) -> str | None:
+    """Allow local absolute URLs or same-origin relative paths only."""
+    if not value:
+        return None
+    candidate = str(value).strip()
+    if not candidate:
+        return None
+
+    if candidate.startswith("/") and not candidate.startswith("//"):
+        return candidate
+
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if parsed.hostname not in {"127.0.0.1", "localhost"}:
+        return None
+    return candidate
+
+
+class AuthorizeReposApiPayload(BaseModel):
+    repo_full_names: str | list[str]
+    sync_open_prs: bool = True
 
 
 async def _upsert_oauth_user(
@@ -631,6 +987,47 @@ async def _upsert_user_repositories(
     return created, updated
 
 
+async def _upsert_repository_webhook_credentials(
+    db: AsyncSession,
+    *,
+    owner_user_id: int,
+    webhook_rows: list[dict[str, Any]],
+) -> int:
+    """Persist per-repository webhook id + secret generated during authorization."""
+    if not webhook_rows:
+        return 0
+
+    full_names = [
+        str(item.get("repo_full_name") or "").strip()
+        for item in webhook_rows
+        if str(item.get("repo_full_name") or "").strip()
+    ]
+    if not full_names:
+        return 0
+
+    result = await db.execute(
+        select(Repository).where(Repository.full_name.in_(full_names))
+    )
+    existing = {row.full_name: row for row in result.scalars().all()}
+
+    updated = 0
+    for item in webhook_rows:
+        full_name = str(item.get("repo_full_name") or "").strip()
+        webhook_secret = str(item.get("webhook_secret") or "").strip()
+        if not full_name or not webhook_secret:
+            continue
+
+        row = existing.get(full_name)
+        if not row:
+            continue
+        row.owner_user_id = owner_user_id
+        row.webhook_id = _coerce_int(item.get("hook_id"))
+        row.webhook_secret_encrypted = webhook_secret
+        row.is_active = True
+        updated += 1
+    return updated
+
+
 def _render_scan_rows(
     rows: list[dict[str, Any]],
     *,
@@ -669,6 +1066,8 @@ def _render_authorization_ui(
     *,
     oauth_enabled: bool,
     github_login: str | None,
+    webhook_target: str,
+    webhook_target_public: bool,
     repositories: list[dict[str, Any]],
     flash_level: str | None,
     flash_message: str | None,
@@ -684,6 +1083,15 @@ def _render_authorization_ui(
     if flash_message:
         cls = "ok" if flash_level == "success" else "err"
         notice_html = f"<div class='notice {cls}'>{escape(flash_message)}</div>"
+
+    webhook_help = ""
+    if not webhook_target_public:
+        webhook_help = (
+            "<div class='notice err'>Webhook URL must be a public HTTPS URL. "
+            "Set <code>PUBLIC_BASE_URL</code> to your tunnel/domain "
+            "(for example: <code>https://your-subdomain.trycloudflare.com</code>) "
+            "and restart the app.</div>"
+        )
 
     options: list[str] = []
     if repositories:
@@ -713,6 +1121,10 @@ def _render_authorization_ui(
         f"<select id='repo_full_name_list' name='repo_full_name_list' multiple size='8'{select_disabled}>"
         f"{''.join(options)}"
         "</select>"
+        "<label class='inline-check'>"
+        "<input type='checkbox' name='sync_open_prs' value='1' checked />"
+        "<span>Queue existing open PRs immediately</span>"
+        "</label>"
         f"<div class='muted'>{escape(hint)}</div>"
         f"<button type='submit'{button_disabled}>Authorize Repositories</button>"
         "</form>"
@@ -895,6 +1307,17 @@ def _render_authorization_ui(
       background: #334155;
     }}
     .stack {{ display: flex; flex-direction: column; gap: 10px; }}
+    .inline-check {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 500;
+    }}
+    .inline-check input {{
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+    }}
     label {{ font-weight: 600; font-size: 0.95rem; }}
     select {{
       padding: 10px;
@@ -995,8 +1418,10 @@ def _render_authorization_ui(
         <article class="card">
           <h2>1. GitHub Configuration</h2>
           <p class="muted">OAuth scopes requested: <code>repo</code> and <code>read:user</code>.</p>
-          <p class="muted">Webhook target: <code>{escape(settings.public_base_url.rstrip('/'))}/webhook</code></p>
-          <p class="muted">Webhook events: <code>pull_request</code>, <code>installation</code>, <code>installation_repositories</code></p>
+          <p class="muted">Webhook target: <code>{escape(webhook_target)}</code></p>
+          <p class="muted">Webhook secret is generated per repository automatically during authorization.</p>
+          <p class="muted">Repository webhook event: <code>pull_request</code>. App-level events <code>installation</code> and <code>installation_repositories</code> are handled when your GitHub App sends them.</p>
+          {webhook_help}
           {connect_html}
         </article>
         <article class="card">
@@ -1055,6 +1480,9 @@ async def ui_home(request: Request):
     spam_rows: list[dict[str, Any]] = []
     connected_users: list[dict[str, Any]] = []
     managed_repositories: list[dict[str, Any]] = []
+    effective_public_base_url = _effective_public_base_url(request)
+    webhook_target = _webhook_target_url(effective_public_base_url)
+    webhook_target_public = _is_public_https_base_url(effective_public_base_url)
 
     if oauth_token:
         try:
@@ -1172,6 +1600,8 @@ async def ui_home(request: Request):
     html = _render_authorization_ui(
         oauth_enabled=settings.github_oauth_enabled,
         github_login=str(github_login) if github_login else None,
+        webhook_target=webhook_target,
+        webhook_target_public=webhook_target_public,
         repositories=repositories,
         flash_level=flash_level,
         flash_message=flash_message,
@@ -1187,7 +1617,7 @@ async def ui_home(request: Request):
 
 
 @app.get("/auth/github/start", include_in_schema=False)
-async def github_auth_start(request: Request):
+async def github_auth_start(request: Request, next: str | None = None):
     if not settings.github_oauth_enabled:
         _set_flash(
             request,
@@ -1197,12 +1627,18 @@ async def github_auth_start(request: Request):
         )
         return RedirectResponse(url="/ui", status_code=302)
 
+    safe_next = _safe_next_redirect_url(next)
+    if safe_next:
+        request.session["github_oauth_next_url"] = safe_next
+    else:
+        request.session.pop("github_oauth_next_url", None)
+
     state = secrets.token_urlsafe(24)
     request.session["github_oauth_state"] = state
     query = urlencode(
         {
             "client_id": settings.github_oauth_client_id,
-            "redirect_uri": _github_oauth_redirect_uri(),
+            "redirect_uri": _github_oauth_redirect_uri(request),
             "scope": "repo read:user",
             "state": state,
         }
@@ -1217,9 +1653,10 @@ async def github_auth_callback(
     state: str | None = None,
 ):
     expected_state = request.session.pop("github_oauth_state", None)
+    next_url = _safe_next_redirect_url(request.session.pop("github_oauth_next_url", None))
     if not code or not state or state != expected_state:
         _set_flash(request, "error", "Invalid GitHub OAuth state or missing code.")
-        return RedirectResponse(url="/ui", status_code=302)
+        return RedirectResponse(url=next_url or "/ui", status_code=302)
 
     try:
         token = await _github_exchange_oauth_code(code)
@@ -1246,7 +1683,7 @@ async def github_auth_callback(
     except Exception as exc:
         _set_flash(request, "error", f"GitHub OAuth failed: {exc}")
 
-    return RedirectResponse(url="/ui", status_code=302)
+    return RedirectResponse(url=next_url or "/ui", status_code=302)
 
 
 @app.post("/auth/github/logout", include_in_schema=False)
@@ -1256,6 +1693,7 @@ async def github_auth_logout(request: Request):
     request.session.pop("github_user_id", None)
     request.session.pop("sentinel_user_id", None)
     request.session.pop("github_oauth_state", None)
+    request.session.pop("github_oauth_next_url", None)
     request.session.pop("ui_repo_name_prefill", None)
     _set_flash(request, "success", "GitHub account disconnected.")
     return RedirectResponse(url="/ui", status_code=302)
@@ -1271,6 +1709,8 @@ async def authorize_repositories(request: Request):
     form = await request.form()
     selected_repo_names = [str(v).strip() for v in form.getlist("repo_full_name_list")]
     typed_repo_names = _parse_repo_names(str(form.get("repo_full_names", "")).strip())
+    sync_open_prs_raw = str(form.get("sync_open_prs", "1")).strip().lower()
+    sync_open_prs = sync_open_prs_raw not in {"0", "false", "off", "no"}
     repo_full_names = list(dict.fromkeys(
         [name for name in (*selected_repo_names, *typed_repo_names) if name and "/" in name]
     ))
@@ -1285,6 +1725,20 @@ async def authorize_repositories(request: Request):
         )
         return RedirectResponse(url="/ui", status_code=302)
 
+    effective_public_base_url = _effective_public_base_url(request)
+    if not _is_public_https_base_url(effective_public_base_url):
+        _set_flash(
+            request,
+            "error",
+            (
+                "Webhook setup requires PUBLIC_BASE_URL to be a public HTTPS URL. "
+                f"Current base URL is {effective_public_base_url}. "
+                "Set PUBLIC_BASE_URL to your public tunnel/domain and retry."
+            ),
+        )
+        return RedirectResponse(url="/ui", status_code=302)
+    webhook_target = _webhook_target_url(effective_public_base_url)
+
     visible_repo_by_name: dict[str, dict[str, Any]] = {}
     try:
         visible_repositories = await _github_list_repositories(str(oauth_token))
@@ -1295,11 +1749,25 @@ async def authorize_repositories(request: Request):
         visible_repo_by_name = {}
 
     try:
-        succeeded, failed = await _ensure_repo_webhooks(str(oauth_token), repo_full_names)
+        succeeded_rows, failed = await _ensure_repo_webhooks(
+            str(oauth_token),
+            repo_full_names,
+            webhook_target=webhook_target,
+        )
+        succeeded = [
+            str(item.get("repo_full_name") or "").strip()
+            for item in succeeded_rows
+            if str(item.get("repo_full_name") or "").strip()
+        ]
         sentinel_user_id = _coerce_int(request.session.get("sentinel_user_id"))
         linked_count = 0
         created_repos = 0
         updated_repos = 0
+        webhook_credentials_saved = 0
+        fetched_open_prs = 0
+        queued_open_prs = 0
+        skipped_open_prs = 0
+        sync_failures: list[str] = []
         metadata_failures: list[str] = []
         if settings.supabase_uses_postgres and sentinel_user_id is not None:
             repositories_to_persist: list[dict[str, Any]] = []
@@ -1324,16 +1792,33 @@ async def authorize_repositories(request: Request):
                     owner_user_id=sentinel_user_id,
                     repositories=repositories_to_persist,
                 )
+                webhook_credentials_saved = await _upsert_repository_webhook_credentials(
+                    db,
+                    owner_user_id=sentinel_user_id,
+                    webhook_rows=succeeded_rows,
+                )
 
-        if failed or metadata_failures:
-            failed_preview = "; ".join((failed + metadata_failures)[:3])
+        if sync_open_prs and succeeded:
+            (
+                fetched_open_prs,
+                queued_open_prs,
+                skipped_open_prs,
+                sync_failures,
+            ) = await _sync_open_prs_for_repositories(str(oauth_token), succeeded)
+
+        combined_failures = failed + metadata_failures + sync_failures
+        if combined_failures:
+            failed_preview = "; ".join(combined_failures[:3])
             _set_flash(
                 request,
                 "error",
                 (
-                    f"Authorized {len(succeeded)} repos, failed {len(failed) + len(metadata_failures)}. "
+                    f"Authorized {len(succeeded)} repos, failed {len(combined_failures)}. "
                     f"Linked {linked_count} repos; persisted repo records "
-                    f"(created={created_repos}, updated={updated_repos}). "
+                    f"(created={created_repos}, updated={updated_repos}, "
+                    f"webhook_credentials={webhook_credentials_saved}); "
+                    f"open PRs fetched={fetched_open_prs}, queued={queued_open_prs}, "
+                    f"skipped={skipped_open_prs}. "
                     f"Failures: {failed_preview}"
                 ),
             )
@@ -1344,7 +1829,10 @@ async def authorize_repositories(request: Request):
                 (
                     f"Authorized {len(succeeded)} repositories successfully. "
                     f"Linked {linked_count} repos; persisted repo records "
-                    f"(created={created_repos}, updated={updated_repos})."
+                    f"(created={created_repos}, updated={updated_repos}, "
+                    f"webhook_credentials={webhook_credentials_saved}); "
+                    f"open PRs fetched={fetched_open_prs}, queued={queued_open_prs}, "
+                    f"skipped={skipped_open_prs}."
                 ),
             )
     except Exception as exc:
@@ -1356,6 +1844,175 @@ async def authorize_repositories(request: Request):
 async def authorize_repository_legacy(request: Request):
     """Backward-compatible alias for older UI form action."""
     return await authorize_repositories(request)
+
+
+@app.get("/api/setup/status")
+async def setup_status(request: Request):
+    """Setup metadata for the React quick-start panel."""
+    oauth_token = request.session.get("github_oauth_token")
+    github_login = request.session.get("github_user_login")
+    effective_public_base_url = _effective_public_base_url(request)
+
+    return {
+        "oauth_enabled": settings.github_oauth_enabled,
+        "connected": bool(oauth_token and github_login),
+        "github_login": str(github_login) if github_login else None,
+        "webhook_target": _webhook_target_url(effective_public_base_url),
+        "webhook_target_public": _is_public_https_base_url(effective_public_base_url),
+        "connect_path": "/auth/github/start",
+        "disconnect_path": "/auth/github/logout",
+    }
+
+
+@app.post("/api/setup/logout")
+async def setup_logout(request: Request):
+    """Clear GitHub session values for React UI."""
+    request.session.pop("github_oauth_token", None)
+    request.session.pop("github_user_login", None)
+    request.session.pop("github_user_id", None)
+    request.session.pop("sentinel_user_id", None)
+    request.session.pop("github_oauth_state", None)
+    request.session.pop("github_oauth_next_url", None)
+    request.session.pop("ui_repo_name_prefill", None)
+    return {"ok": True, "message": "Disconnected GitHub session."}
+
+
+@app.post("/api/setup/authorize-repos")
+async def setup_authorize_repositories(request: Request, payload: AuthorizeReposApiPayload):
+    """Authorize repositories from React UI and optionally queue open PR scans."""
+    oauth_token = request.session.get("github_oauth_token")
+    if not oauth_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Connect GitHub before authorizing repositories.",
+        )
+
+    repo_full_names = _normalize_repo_names(payload.repo_full_names)
+    if not repo_full_names:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide at least one repository in owner/repo format.",
+        )
+
+    effective_public_base_url = _effective_public_base_url(request)
+    webhook_target_public = _is_public_https_base_url(effective_public_base_url)
+    webhook_target = _webhook_target_url(effective_public_base_url)
+
+    visible_repo_by_name: dict[str, dict[str, Any]] = {}
+    try:
+        visible_repositories = await _github_list_repositories(str(oauth_token))
+        visible_repo_by_name = {
+            str(repo.get("full_name", "")).strip(): repo for repo in visible_repositories
+        }
+    except Exception:
+        visible_repo_by_name = {}
+
+    failed: list[str] = []
+    if webhook_target_public:
+        succeeded_rows, failed = await _ensure_repo_webhooks(
+            str(oauth_token),
+            repo_full_names,
+            webhook_target=webhook_target,
+        )
+    else:
+        succeeded_rows = [{"repo_full_name": name, "hook_id": None, "webhook_secret": ""} for name in repo_full_names]
+        failed.append(
+            "Webhook setup skipped because PUBLIC_BASE_URL is not a public HTTPS URL."
+        )
+    succeeded = [
+        str(item.get("repo_full_name") or "").strip()
+        for item in succeeded_rows
+        if str(item.get("repo_full_name") or "").strip()
+    ]
+
+    sentinel_user_id = _coerce_int(request.session.get("sentinel_user_id"))
+    linked_count = 0
+    created_repos = 0
+    updated_repos = 0
+    webhook_credentials_saved = 0
+    fetched_open_prs = 0
+    queued_open_prs = 0
+    skipped_open_prs = 0
+    sync_failures: list[str] = []
+    metadata_failures: list[str] = []
+
+    if settings.supabase_uses_postgres and sentinel_user_id is not None:
+        repositories_to_persist: list[dict[str, Any]] = []
+        for full_name in succeeded:
+            meta = visible_repo_by_name.get(full_name)
+            if meta is None:
+                try:
+                    meta = await _github_get_repository(str(oauth_token), full_name)
+                except Exception as exc:
+                    metadata_failures.append(f"{full_name}: {exc}")
+                    continue
+            repositories_to_persist.append(meta)
+
+        async with _dashboard_db_session() as db:
+            linked_count = await _link_owner_to_repositories(
+                db,
+                owner_user_id=sentinel_user_id,
+                repo_full_names=succeeded,
+            )
+            created_repos, updated_repos = await _upsert_user_repositories(
+                db,
+                owner_user_id=sentinel_user_id,
+                repositories=repositories_to_persist,
+            )
+            webhook_credentials_saved = await _upsert_repository_webhook_credentials(
+                db,
+                owner_user_id=sentinel_user_id,
+                webhook_rows=succeeded_rows,
+            )
+
+    if payload.sync_open_prs and succeeded:
+        (
+            fetched_open_prs,
+            queued_open_prs,
+            skipped_open_prs,
+            sync_failures,
+        ) = await _sync_open_prs_for_repositories(str(oauth_token), succeeded)
+
+    combined_failures = failed + metadata_failures + sync_failures
+    logger.info(
+        "UI authorization summary: repos=%d succeeded=%d failures=%d queued_prs=%d",
+        len(repo_full_names),
+        len(succeeded),
+        len(combined_failures),
+        queued_open_prs,
+    )
+
+    if combined_failures:
+        message = (
+            f"Authorized {len(succeeded)} repos, failed {len(combined_failures)}. "
+            f"Queued open PRs={queued_open_prs}."
+        )
+    else:
+        message = (
+            f"Authorized {len(succeeded)} repositories successfully. "
+            f"Queued open PRs={queued_open_prs}."
+        )
+
+    return {
+        "ok": len(combined_failures) == 0,
+        "message": message,
+        "webhook_target_public": webhook_target_public,
+        "webhook_target": webhook_target,
+        "authorized_repositories": succeeded,
+        "failures": combined_failures,
+        "counts": {
+            "requested_repositories": len(repo_full_names),
+            "authorized_repositories": len(succeeded),
+            "failed_repositories": len(combined_failures),
+            "linked_repositories": linked_count,
+            "created_repositories": created_repos,
+            "updated_repositories": updated_repos,
+            "saved_webhook_credentials": webhook_credentials_saved,
+            "fetched_open_prs": fetched_open_prs,
+            "queued_open_prs": queued_open_prs,
+            "skipped_open_prs": skipped_open_prs,
+        },
+    }
 
 
 @app.get("/api/dashboard/stats")
@@ -1504,15 +2161,23 @@ async def health():
 async def health_services():
     """Diagnostic endpoint — tests connectivity to Redis, Groq, and Supabase."""
     results: dict[str, Any] = {}
+    oauth_users = await _active_oauth_user_count()
 
     # ── Redis (Upstash) ─────────────────────────────────────────────────
-    try:
-        import redis as redis_lib
-        r = redis_lib.from_url(settings.redis_url, socket_timeout=5)
-        pong = r.ping()
-        results["redis"] = {"status": "ok", "ping": pong}
-    except Exception as e:
-        results["redis"] = {"status": "error", "detail": str(e)}
+    if settings.use_celery_worker:
+        try:
+            import redis as redis_lib
+            r = redis_lib.from_url(settings.redis_url, socket_timeout=5)
+            pong = r.ping()
+            results["redis"] = {"status": "ok", "ping": pong}
+        except Exception as e:
+            results["redis"] = {"status": "error", "detail": str(e)}
+    else:
+        results["redis"] = {
+            "status": "ok",
+            "mode": "inline",
+            "detail": "Celery worker disabled; Redis not required.",
+        }
 
     # ── Groq API ────────────────────────────────────────────────────────
     try:
@@ -1534,12 +2199,29 @@ async def health_services():
 
         gh = Github(auth=Auth.Token(settings.github_token))
         login = gh.get_user().login
-        results["github"] = {"status": "ok", "login": login}
+        github_payload: dict[str, Any] = {"status": "ok", "login": login}
+        if oauth_users > 0:
+            github_payload["oauth_connected_users"] = oauth_users
+        results["github"] = github_payload
     except Exception as e:
         detail = str(e)
-        if settings.github_token_is_placeholder:
-            detail = f"{detail} | hint: GITHUB_TOKEN appears to be a placeholder."
-        results["github"] = {"status": "error", "detail": detail}
+        if settings.github_token_is_placeholder and oauth_users > 0:
+            results["github"] = {
+                "status": "ok",
+                "mode": "oauth_user_tokens",
+                "oauth_connected_users": oauth_users,
+                "detail": (
+                    "Global GITHUB_TOKEN is placeholder; using per-user OAuth "
+                    "tokens for UI-connected repositories."
+                ),
+            }
+        else:
+            if settings.github_token_is_placeholder:
+                detail = (
+                    f"{detail} | hint: GITHUB_TOKEN appears to be a placeholder "
+                    "and no active OAuth user tokens were found."
+                )
+            results["github"] = {"status": "error", "detail": detail}
 
     # ── Supabase ────────────────────────────────────────────────────────
     supabase_mode = "postgres" if settings.supabase_uses_postgres else "rest"
@@ -1619,8 +2301,21 @@ async def webhook(
 ):
     """Receive GitHub webhook events and enqueue for processing."""
     body = await request.body()
-    _verify_signature(body, x_hub_signature_256)
-    payload = await request.json()
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid JSON payload: {exc}",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid webhook payload type.",
+        )
+
+    await _verify_signature(body, x_hub_signature_256, payload)
     action = str(payload.get("action", ""))
 
     if x_github_event == "pull_request":

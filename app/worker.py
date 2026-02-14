@@ -28,10 +28,11 @@ from celery import Celery
 from git import Repo
 from github import Auth, Github
 from github.GithubException import BadCredentialsException, GithubException
+from sqlalchemy import select
 
 from app.config import get_settings
 from app.database import _get_session_factory
-from app.models import PRScan, Verdict
+from app.models import PRScan, Repository, User, Verdict
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -55,6 +56,20 @@ celery_app.conf.update(
 
 _groq = None
 _analyzer = None
+_worker_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _run_async(coro):
+    """Run async code on a stable worker event loop.
+
+    Celery tasks are sync functions; using ``asyncio.run`` per task creates
+    a new event loop each time, which breaks asyncpg connections bound to a
+    previous loop. Reusing one loop avoids cross-loop DB errors.
+    """
+    global _worker_loop
+    if _worker_loop is None or _worker_loop.is_closed():
+        _worker_loop = asyncio.new_event_loop()
+    return _worker_loop.run_until_complete(coro)
 
 
 def _get_groq():
@@ -76,8 +91,48 @@ def _get_analyzer():
 # ── Helper: GitHub client ───────────────────────────────────────────────────
 
 
-def _github() -> Github:
-    return Github(auth=Auth.Token(settings.github_token))
+def _github(token: str | None = None) -> Github:
+    return Github(auth=Auth.Token(token or settings.github_token))
+
+
+def _lookup_repo_access_token(repo_full_name: str) -> str | None:
+    """Return stored OAuth token for the repository owner, if available."""
+    if not settings.supabase_uses_postgres:
+        return None
+    try:
+        return _run_async(_lookup_repo_access_token_async(repo_full_name))
+    except Exception:
+        logger.exception("Could not resolve repo access token for %s", repo_full_name)
+        return None
+
+
+async def _lookup_repo_access_token_async(repo_full_name: str) -> str | None:
+    factory = _get_session_factory()
+    async with factory() as session:
+        repo_stmt = (
+            select(Repository.owner_user_id)
+            .where(
+                Repository.full_name == repo_full_name,
+                Repository.is_active.is_(True),
+            )
+            .limit(1)
+        )
+        owner_user_id = await session.scalar(repo_stmt)
+        if owner_user_id is None:
+            return None
+
+        user_stmt = (
+            select(User.access_token_encrypted)
+            .where(
+                User.id == owner_user_id,
+                User.is_active.is_(True),
+            )
+            .limit(1)
+        )
+        token = await session.scalar(user_stmt)
+        if not token:
+            return None
+        return str(token)
 
 
 # ── Helper: fetch .sentinel.yaml ────────────────────────────────────────────
@@ -217,7 +272,7 @@ def _parse_quality_report(quality: dict[str, Any]) -> tuple[float, list[dict[str
 def _persist_scan_result(result: dict[str, Any]) -> None:
     """Best-effort persistence of each scan result into Supabase."""
     try:
-        asyncio.run(_persist_scan_result_async(result))
+        _run_async(_persist_scan_result_async(result))
     except Exception:
         logger.exception(
             "Could not persist scan result for %s#%s",
@@ -414,36 +469,75 @@ def process_pr(self, payload: dict[str, Any]) -> dict[str, Any]:  # noqa: C901
 
     logger.info("Processing %s#%s", repo_full_name, pr_number)
 
-    if settings.github_token_is_placeholder:
+    repo_access_token = _lookup_repo_access_token(repo_full_name)
+    if settings.github_token_is_placeholder and not repo_access_token:
         return _finalize(_build_early_result(
             payload,
             repo_full_name,
             pr_number,
             verdict=Verdict.SOFT_FAIL,
             reason=(
-                "GitHub token appears to be a placeholder. "
-                "Set a real GITHUB_TOKEN to enable PR processing."
+                "GitHub token appears to be a placeholder and no repository "
+                "OAuth token was found. Set a real GITHUB_TOKEN or connect "
+                "the repository via the UI."
             ),
         ))
 
     # ── 1. Fetch PR & author info via PyGitHub ──────────────────────────
+    github_client = _github(repo_access_token) if repo_access_token else _github()
     try:
-        g = _github()
-        repo = g.get_repo(repo_full_name)
+        repo = github_client.get_repo(repo_full_name)
         pr = repo.get_pull(pr_number)
         author = pr.user
     except BadCredentialsException:
-        logger.error("GitHub authentication failed for %s#%s", repo_full_name, pr_number)
-        return _finalize(_build_early_result(
-            payload,
-            repo_full_name,
-            pr_number,
-            verdict=Verdict.SOFT_FAIL,
-            reason=(
-                "GitHub authentication failed (401 Bad credentials). "
-                "Update GITHUB_TOKEN."
-            ),
-        ))
+        if repo_access_token and repo_access_token != settings.github_token:
+            logger.warning(
+                "Repo token invalid for %s; falling back to GITHUB_TOKEN.",
+                repo_full_name,
+            )
+            try:
+                github_client = _github()
+                repo = github_client.get_repo(repo_full_name)
+                pr = repo.get_pull(pr_number)
+                author = pr.user
+            except BadCredentialsException:
+                logger.error("GitHub authentication failed for %s#%s", repo_full_name, pr_number)
+                return _finalize(_build_early_result(
+                    payload,
+                    repo_full_name,
+                    pr_number,
+                    verdict=Verdict.SOFT_FAIL,
+                    reason=(
+                        "GitHub authentication failed (401 Bad credentials). "
+                        "Update GITHUB_TOKEN."
+                    ),
+                ))
+            except GithubException as exc:
+                logger.error(
+                    "GitHub API error while loading %s#%s after fallback: %s",
+                    repo_full_name,
+                    pr_number,
+                    exc,
+                )
+                return _finalize(_build_early_result(
+                    payload,
+                    repo_full_name,
+                    pr_number,
+                    verdict=Verdict.SOFT_FAIL,
+                    reason=f"GitHub API error before analysis: {exc}",
+                ))
+        else:
+            logger.error("GitHub authentication failed for %s#%s", repo_full_name, pr_number)
+            return _finalize(_build_early_result(
+                payload,
+                repo_full_name,
+                pr_number,
+                verdict=Verdict.SOFT_FAIL,
+                reason=(
+                    "GitHub authentication failed (401 Bad credentials). "
+                    "Update GITHUB_TOKEN."
+                ),
+            ))
     except GithubException as exc:
         logger.error(
             "GitHub API error while loading %s#%s: %s",

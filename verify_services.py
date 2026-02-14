@@ -5,8 +5,10 @@ import sys
 sys.path.append('.')
 
 from app.config import get_settings
+from app.database import _get_session_factory
+from app.models import User
 from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from groq import Groq
 import redis.asyncio as redis
 import httpx
@@ -22,9 +24,9 @@ def debug_print(msg):
 
 debug_print("Imports complete. Starting verification...")
 
-async def verify_grok():
+async def verify_groq():
     settings = get_settings()
-    logger.info(f"Verifying Grok API (Model: {settings.groq_model})...")
+    logger.info(f"Verifying Groq API (Model: {settings.groq_model})...")
     try:
         client = Groq(api_key=settings.groq_api_key)
         response = client.chat.completions.create(
@@ -33,14 +35,17 @@ async def verify_grok():
             max_tokens=5
         )
         content = response.choices[0].message.content
-        logger.info(f"✅ Grok API is working. Response: {content!r}")
+        logger.info(f"✅ Groq API is working. Response: {content!r}")
         return True
     except Exception as e:
-        logger.error(f"❌ Grok API failed: {e}")
+        logger.error(f"❌ Groq API failed: {e}")
         return False
 
 async def verify_redis():
     settings = get_settings()
+    if not settings.use_celery_worker:
+        logger.info("✅ Redis check skipped (inline processing mode).")
+        return True
     logger.info("Verifying Redis...")
     try:
         r = redis.from_url(settings.redis_url)
@@ -55,6 +60,28 @@ async def verify_redis():
 async def verify_github():
     settings = get_settings()
     logger.info("Verifying GitHub API token...")
+    oauth_user_count = 0
+    if settings.supabase_uses_postgres:
+        try:
+            factory = _get_session_factory()
+            async with factory() as session:
+                stmt = select(func.count(User.id)).where(
+                    User.is_active.is_(True),
+                    User.access_token_encrypted.is_not(None),
+                    User.access_token_encrypted != "",
+                )
+                oauth_user_count = int((await session.scalar(stmt)) or 0)
+        except Exception as e:
+            logger.warning(f"Could not query OAuth user tokens: {e}")
+
+    if settings.github_token_is_placeholder and oauth_user_count > 0:
+        logger.info(
+            "✅ GitHub auth is available via OAuth user tokens "
+            "(connected users: %s).",
+            oauth_user_count,
+        )
+        return True
+
     try:
         gh = Github(auth=Auth.Token(settings.github_token))
         login = gh.get_user().login
@@ -63,7 +90,9 @@ async def verify_github():
     except Exception as e:
         if settings.github_token_is_placeholder:
             logger.error(
-                f"❌ GitHub failed: {e} | hint: GITHUB_TOKEN appears to be placeholder."
+                "❌ GitHub failed: %s | hint: GITHUB_TOKEN appears to be "
+                "placeholder and no active OAuth user tokens were found.",
+                e,
             )
         else:
             logger.error(f"❌ GitHub failed: {e}")
@@ -131,12 +160,12 @@ async def main():
     
     # Run tests
     # Note: We run sequentially to clearly see output
-    grok_ok = await verify_grok()
+    groq_ok = await verify_groq()
     redis_ok = await verify_redis()
     github_ok = await verify_github()
     supabase_ok = await verify_supabase()
 
-    if grok_ok and redis_ok and github_ok and supabase_ok:
+    if groq_ok and redis_ok and github_ok and supabase_ok:
         logger.info("\n🎉 All services are verified and working!")
         sys.exit(0)
     else:

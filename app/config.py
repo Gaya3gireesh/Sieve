@@ -35,8 +35,8 @@ class Settings(BaseSettings):
     redis_url: str  # e.g. rediss://default:xxx@endpoint.upstash.io:6379
 
     # ── GitHub ──
-    github_webhook_secret: str
-    github_token: str
+    github_webhook_secret: str = ""
+    github_token: str = ""
     github_oauth_client_id: str = ""
     github_oauth_client_secret: str = ""
 
@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     supabase_probe_rest_table: bool = False
     public_base_url: str = "http://127.0.0.1:8000"
     ui_session_secret: str = "sentinel-dev-session-secret"
+    use_celery_worker: bool = True
 
     @model_validator(mode="after")
     def validate_supabase_url(self) -> "Settings":
@@ -91,6 +92,8 @@ class Settings(BaseSettings):
     def github_token_is_placeholder(self) -> bool:
         """Best-effort detection of obvious placeholder tokens."""
         token = self.github_token.strip().lower()
+        if not token:
+            return True
         markers = (
             "your_personal_access",
             "ghp_your",
@@ -99,6 +102,10 @@ class Settings(BaseSettings):
             "test-token",
         )
         return any(marker in token for marker in markers)
+
+    @property
+    def github_webhook_secret_configured(self) -> bool:
+        return bool(self.github_webhook_secret.strip())
 
     @property
     def supabase_key_is_publishable(self) -> bool:
