@@ -34,32 +34,36 @@ async function fetchJson(path, params = {}, options = {}) {
     ...options,
   })
 
+  // Read body once and only once
+  let bodyText = ''
+  try {
+    bodyText = await response.text()
+  } catch (e) {
+    console.error('Error reading response body:', e)
+    throw new Error(`Request failed (${response.status}): could not read response`)
+  }
+
   if (!response.ok) {
     let message = `Request failed (${response.status})`
-    try {
-      // Use clone to avoid "body already read" errors
-      const clonedResponse = response.clone()
-      const text = await clonedResponse.text()
-      if (text) {
-        try {
-          const body = JSON.parse(text)
-          message = body.detail || body.message || message
-        } catch {
-          message = text
-        }
+    if (bodyText) {
+      try {
+        const body = JSON.parse(bodyText)
+        message = body.detail || body.message || message
+      } catch {
+        message = bodyText
       }
-    } catch (e) {
-      // If clone fails, just use status-based message
-      console.error('Error reading response body:', e)
     }
     throw new Error(message)
   }
 
+  // Parse JSON from the body we already read
   const contentType = response.headers.get('content-type') || ''
   if (!contentType.includes('application/json')) return {}
   
+  if (!bodyText) return {}
+  
   try {
-    return await response.json()
+    return JSON.parse(bodyText)
   } catch (e) {
     console.error('Error parsing JSON response:', e)
     return {}
