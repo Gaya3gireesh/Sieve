@@ -37,7 +37,9 @@ async function fetchJson(path, params = {}, options = {}) {
   if (!response.ok) {
     let message = `Request failed (${response.status})`
     try {
-      const text = await response.text()
+      // Use clone to avoid "body already read" errors
+      const clonedResponse = response.clone()
+      const text = await clonedResponse.text()
       if (text) {
         try {
           const body = JSON.parse(text)
@@ -46,15 +48,22 @@ async function fetchJson(path, params = {}, options = {}) {
           message = text
         }
       }
-    } catch {
-      // Silent catch block
+    } catch (e) {
+      // If clone fails, just use status-based message
+      console.error('Error reading response body:', e)
     }
     throw new Error(message)
   }
 
   const contentType = response.headers.get('content-type') || ''
   if (!contentType.includes('application/json')) return {}
-  return response.json()
+  
+  try {
+    return await response.json()
+  } catch (e) {
+    console.error('Error parsing JSON response:', e)
+    return {}
+  }
 }
 
 function prettyDate(isoString) {
