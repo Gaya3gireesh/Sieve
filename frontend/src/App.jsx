@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
+console.log('API_BASE:', API_BASE, 'VITE_API_BASE env:', import.meta.env.VITE_API_BASE)
 
 const TAB_CONFIG = {
   queue: {
