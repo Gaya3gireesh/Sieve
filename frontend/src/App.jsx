@@ -37,11 +37,17 @@ async function fetchJson(path, params = {}, options = {}) {
   if (!response.ok) {
     let message = `Request failed (${response.status})`
     try {
-      const body = await response.json()
-      message = body.detail || body.message || message
-    } catch {
       const text = await response.text()
-      if (text) message = text
+      if (text) {
+        try {
+          const body = JSON.parse(text)
+          message = body.detail || body.message || message
+        } catch {
+          message = text
+        }
+      }
+    } catch {
+      // Silent catch block
     }
     throw new Error(message)
   }
