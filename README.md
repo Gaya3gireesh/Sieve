@@ -2,55 +2,86 @@
   <img src="./img.png" alt="Project Banner" width="100%">
 </p>
 
-# [Project Name] 🎯
+# [Sieve] 🎯
 
 ## Basic Details
 
-### Team Name: [Name]
+### Team Name: [GAYATHRI M]
 
 ### Team Members
-- Member 1: [Name] - [College]
-- Member 2: [Name] - [College]
+- Member 1: [GAYATHRI M] - [SCMS SCHOOL OF ENGINEERING AND TECHNOLOGY]
+
 
 ### Hosted Project Link
-[mention your project hosted link here]
+[https://sieve-lemon.vercel.app/]
 
 ### Project Description
-[2-3 lines about what your project does]
+[Sieve is an intelligent automated middleware for GitHub repositories that filters pull requests before they reach the maintainer. By leveraging regex-based parsing and Large Language Models (LLMs), it acts as a quality control layer, analyzing the intent, effort, and relevance of every submission to ensure only high-value code enters the review queue.]
 
 ### The Problem statement
-[What problem are you solving?]
+[Open-source maintainers are overwhelmed by a flood of low-quality contributions, including "typo-hunting" spam, AI-generated code dumps, and trivial whitespace changes. Current CI tools only verify syntax and build status, failing to detect the "spammy" intent or low-effort nature of these submissions, which drains valuable maintainer time and energy.]
 
 ### The Solution
-[How are you solving it?]
+[Sieve deploys a multi-stage analysis pipeline that calculates an "Effort-to-Noise" ratio and verifies the semantic alignment between code changes and the linked issue. It autonomously closes irrelevant or low-effort PRs with a contextual explanation, while valid, high-intent contributions are labeled and promoted to the maintainer's dashboard for final approval.]
 
 ---
 
 ## Technical Details
 
-### Technologies/Components Used
+### Technologies / Components Used
 
-**For Software:**
-- Languages used: [e.g., JavaScript, Python, Java]
-- Frameworks used: [e.g., React, Django, Spring Boot]
-- Libraries used: [e.g., axios, pandas, JUnit]
-- Tools used: [e.g., VS Code, Git, Docker]
+- **Languages:** Python 3.12, JavaScript (React)
+- **Backend framework:** FastAPI (served with `uvicorn`)
+- **Worker / background processing:** Celery
+- **Broker / cache:** Redis
+- **Database:** PostgreSQL (Supabase-compatible) with `asyncpg` / `psycopg2`, ORM via SQLAlchemy and migrations via Alembic
+- **HTTP clients & misc:** `httpx`, `requests`, `tenacity`
+- **Validation & config:** Pydantic (v2) and `python-dotenv`
+- **GitHub integration:** `PyGithub`, GitHub OAuth support
+- **Other notable Python deps:** `cryptography`, `groq`, `pyyaml`
+- **Frontend:** React 19 + Vite, `@vitejs/plugin-react`, ESLint
+- **Dev tooling:** Node/npm, Vite (frontend dev server), repo Python virtualenv for backend
 
-**For Hardware:**
-- Main components: [List main components]
-- Specifications: [Technical specifications]
-- Tools required: [List tools needed]
+### Run (local development)
 
+- Backend (using the repository virtualenv):
+
+  1. Activate the venv (if present):
+
+     ```bash
+     source .venv/bin/activate
+     ```
+
+  2. Start the app (entrypoint runs uvicorn):
+
+     ```bash
+     python main.py
+     ```
+
+  - Defaults: `HOST=127.0.0.1`, `PORT=8000` → http://127.0.0.1:8000
+  - Disable automatic Celery worker spawn: `START_WORKER=false`
+  - Enable auto-reload for dev: `RELOAD=true`
+
+- Frontend (React + Vite):
+
+  ```bash
+  cd frontend
+  npm install
+  npm run dev
+  ```
+
+  - Vite dev server default: `http://localhost:5173` (frontend reads `VITE_API_BASE` / `VITE_API_TARGET` in `frontend/.env` or `frontend/.env.example`)
+
+s
 ---
 
 ## Features
 
 List the key features of your project:
-- Feature 1: [Description]
-- Feature 2: [Description]
-- Feature 3: [Description]
-- Feature 4: [Description]
-
+- PR Pre-screening: Auto-analyzes incoming PRs for relevance and quality.
+- Effort-to-Noise Scoring: Produces a single score combining heuristics and LLM signals.
+- Auto Actions: Auto-labels, comments, or closes low-effort PRs with explanations.
+- Async Pipeline & Integrations: Celery workers + GitHub webhooks, Redis, Postgres for scalable processing.
 ---
 
 ## Implementation
@@ -58,22 +89,90 @@ List the key features of your project:
 ### For Software:
 
 #### Installation
+
+1. Create and activate a Python virtual environment:
+
 ```bash
-[Installation commands - e.g., npm install, pip install -r requirements.txt]
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
+
+2. Install backend dependencies (uses `pyproject.toml`):
+
+```bash
+# Editable install for development
+pip install -e .
+# Alternatively, if you have a requirements file:
+# pip install -r requirements.txt
+```
+
+3. Install frontend dependencies (optional, for UI):
+
+```bash
+cd frontend
+npm install
+cd ..
+```
+
+4. Configure environment variables:
+
+```bash
+# Copy example env files and edit values
+cp frontend/.env.example frontend/.env || true
+# Create a backend .env at repo root and populate the variables below
+```
+
+Important backend env vars (set in `.env`):
+
+- `SUPABASE_URL` and `SUPABASE_KEY` (or a Postgres DSN in `SUPABASE_URL`)
+- `GROQ_API_KEY` (LLM provider key)
+- `REDIS_URL` (e.g. redis://localhost:6379)
+- `GITHUB_WEBHOOK_SECRET`, `GITHUB_TOKEN`, `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`
+
+If you need ephemeral services for development, run simple Docker containers:
+
+```bash
+# Postgres
+docker run -d --name sieve-postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:15
+# Redis
+docker run -d --name sieve-redis -p 6379:6379 redis:7
 ```
 
 #### Run
+
+1. Apply database migrations (if using Alembic / SQLAlchemy migrations):
+
 ```bash
-[Run commands - e.g., npm start, python app.py]
+alembic upgrade head
 ```
 
-### For Hardware:
+2. Start background worker(s) (Celery example):
 
-#### Components Required
-[List all components needed with specifications]
+```bash
+# from repo root, with venv active
+celery -A app.worker worker --loglevel=info
+```
 
-#### Circuit Setup
-[Explain how to set up the circuit]
+3. Start the backend API (FastAPI / Uvicorn):
+
+```bash
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+4. Start the frontend dev server (optional):
+
+```bash
+cd frontend
+npm run dev
+```
+
+Defaults:
+
+- Backend: http://127.0.0.1:8000
+- Frontend: http://localhost:5173
+
+Use `curl` or the frontend UI to exercise the system during development.
 
 ---
 
@@ -83,14 +182,14 @@ List the key features of your project:
 
 #### Screenshots (Add at least 3)
 
-![Screenshot1](Add screenshot 1 here with proper name)
-*Add caption explaining what this shows*
+![img1](screenshots/img1.png)
+*Caption: Main dashboard showing PR scan results and overall Effort-to-Noise scoring.*
 
-![Screenshot2](Add screenshot 2 here with proper name)
-*Add caption explaining what this shows*
+![img2](screenshots/img2.png)
+*Caption: Pull request detail view with inline analysis and suggested actions.*
 
-![Screenshot3](Add screenshot 3 here with proper name)
-*Add caption explaining what this shows*
+![img3](screenshots/img3.png)
+*Caption: Maintainer review dashboard highlighting auto-labeled and closed PRs.*
 
 #### Diagrams
 
@@ -103,31 +202,6 @@ List the key features of your project:
 
 ![Workflow](docs/workflow.png)
 *Add caption explaining your workflow*
-
----
-
-### For Hardware:
-
-#### Schematic & Circuit
-
-![Circuit](Add your circuit diagram here)
-*Add caption explaining connections*
-
-![Schematic](Add your schematic diagram here)
-*Add caption explaining the schematic*
-
-#### Build Photos
-
-![Team](Add photo of your team here)
-
-![Components](Add photo of your components here)
-*List out all components shown*
-
-![Build](Add photos of build process here)
-*Explain the build steps*
-
-![Final](Add photo of final product here)
-*Explain the final build*
 
 ---
 
@@ -174,91 +248,6 @@ List the key features of your project:
 [Add more endpoints as needed...]
 
 ---
-
-### For Mobile Apps:
-
-#### App Flow Diagram
-
-![App Flow](docs/app-flow.png)
-*Explain the user flow through your application*
-
-#### Installation Guide
-
-**For Android (APK):**
-1. Download the APK from [Release Link]
-2. Enable "Install from Unknown Sources" in your device settings:
-   - Go to Settings > Security
-   - Enable "Unknown Sources"
-3. Open the downloaded APK file
-4. Follow the installation prompts
-5. Open the app and enjoy!
-
-**For iOS (IPA) - TestFlight:**
-1. Download TestFlight from the App Store
-2. Open this TestFlight link: [Your TestFlight Link]
-3. Click "Install" or "Accept"
-4. Wait for the app to install
-5. Open the app from your home screen
-
-**Building from Source:**
-```bash
-# For Android
-flutter build apk
-# or
-./gradlew assembleDebug
-
-# For iOS
-flutter build ios
-# or
-xcodebuild -workspace App.xcworkspace -scheme App -configuration Debug
-```
-
----
-
-### For Hardware Projects:
-
-#### Bill of Materials (BOM)
-
-| Component | Quantity | Specifications | Price | Link/Source |
-|-----------|----------|----------------|-------|-------------|
-| Arduino Uno | 1 | ATmega328P, 16MHz | ₹450 | [Link] |
-| LED | 5 | Red, 5mm, 20mA | ₹5 each | [Link] |
-| Resistor | 5 | 220Ω, 1/4W | ₹1 each | [Link] |
-| Breadboard | 1 | 830 points | ₹100 | [Link] |
-| Jumper Wires | 20 | Male-to-Male | ₹50 | [Link] |
-| [Add more...] | | | | |
-
-**Total Estimated Cost:** ₹[Amount]
-
-#### Assembly Instructions
-
-**Step 1: Prepare Components**
-1. Gather all components listed in the BOM
-2. Check component specifications
-3. Prepare your workspace
-![Step 1](images/assembly-step1.jpg)
-*Caption: All components laid out*
-
-**Step 2: Build the Power Supply**
-1. Connect the power rails on the breadboard
-2. Connect Arduino 5V to breadboard positive rail
-3. Connect Arduino GND to breadboard negative rail
-![Step 2](images/assembly-step2.jpg)
-*Caption: Power connections completed*
-
-**Step 3: Add Components**
-1. Place LEDs on breadboard
-2. Connect resistors in series with LEDs
-3. Connect LED cathodes to GND
-4. Connect LED anodes to Arduino digital pins (2-6)
-![Step 3](images/assembly-step3.jpg)
-*Caption: LED circuit assembled*
-
-**Step 4: [Continue for all steps...]**
-
-**Final Assembly:**
-![Final Build](images/final-build.jpg)
-*Caption: Completed project ready for testing*
 
 ---
 
