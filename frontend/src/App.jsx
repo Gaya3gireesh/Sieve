@@ -4,6 +4,35 @@ import './App.css'
 const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
 console.log('API_BASE:', API_BASE, 'VITE_API_BASE env:', import.meta.env.VITE_API_BASE)
 
+// ── Cross-domain OAuth token helpers ────────────────────────────────────
+function getSavedAuthToken() {
+  return localStorage.getItem('sentinel_auth_token') || ''
+}
+function getSavedGithubLogin() {
+  return localStorage.getItem('sentinel_github_login') || ''
+}
+function saveAuthCredentials(token, login) {
+  localStorage.setItem('sentinel_auth_token', token)
+  localStorage.setItem('sentinel_github_login', login)
+}
+function clearAuthCredentials() {
+  localStorage.removeItem('sentinel_auth_token')
+  localStorage.removeItem('sentinel_github_login')
+}
+
+/** Parse auth credentials from URL hash after OAuth redirect. */
+function consumeHashCredentials() {
+  const hash = window.location.hash
+  if (!hash || !hash.includes('auth_token=')) return null
+  const params = new URLSearchParams(hash.substring(1))
+  const token = params.get('auth_token')
+  const login = params.get('github_login')
+  if (!token) return null
+  // Clear the hash so the token doesn't linger in the URL / browser history.
+  window.history.replaceState(null, '', window.location.pathname + window.location.search)
+  return { token, login: login || 'unknown' }
+}
+
 const TAB_CONFIG = {
   queue: {
     label: 'Queue',
@@ -30,9 +59,18 @@ async function fetchJson(path, params = {}, options = {}) {
   })
 
   const url = `${API_BASE}${path}${query.size ? `?${query.toString()}` : ''}`
+
+  // Build headers, injecting Bearer token when stored locally (cross-domain).
+  const headers = { ...(options.headers || {}) }
+  const savedToken = getSavedAuthToken()
+  if (savedToken && !headers['Authorization']) {
+    headers['Authorization'] = `Bearer ${savedToken}`
+  }
+
   const response = await fetch(url, {
     credentials: 'include',
     ...options,
+    headers,
   })
 
   // Read body once and only once
@@ -124,7 +162,20 @@ function App() {
     }
   }
 
+  // ── Consume OAuth hash credentials on first render ──────────────────
   useEffect(() => {
+    const creds = consumeHashCredentials()
+    if (creds) {
+      saveAuthCredentials(creds.token, creds.login)
+      // Immediately update local setup state so UI reflects \"Connected\"
+      setSetup((prev) => ({
+        ...prev,
+        connected: true,
+        github_login: creds.login,
+        loading: false,
+      }))
+    }
+    // Always fetch the authoritative status from the backend.
     loadSetupStatus()
   }, [])
 
@@ -211,6 +262,7 @@ function App() {
     setQuickBusy(true)
     try {
       await fetchJson('/api/setup/logout', {}, { method: 'POST' })
+      clearAuthCredentials()
       setQuickMessage('GitHub disconnected.')
       setQuickFailures([])
       await loadSetupStatus()

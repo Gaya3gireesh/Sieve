@@ -17,7 +17,7 @@ import secrets
 from contextlib import asynccontextmanager
 from html import escape
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urljoin
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, status
@@ -894,6 +894,64 @@ def _safe_next_redirect_url(value: str | None) -> str | None:
     return None
 
 
+def _is_external_redirect(next_url: str | None, request: Request | None = None) -> bool:
+    """True when next_url points to a different origin than the backend."""
+    if not next_url or next_url.startswith("/"):
+        return False
+    parsed = urlparse(next_url)
+    if not parsed.hostname:
+        return False
+    backend_base = _effective_public_base_url(request)
+    backend_parsed = urlparse(backend_base)
+    return parsed.hostname != backend_parsed.hostname
+
+
+def _get_oauth_credentials(request: Request) -> tuple[str | None, str | None, str | None]:
+    """Get (oauth_token, github_login, sentinel_user_id) from Authorization header OR session.
+
+    When the React frontend is on a different domain (Vercel) the session cookie
+    won't be sent.  The frontend stores the token in localStorage and sends it
+    as ``Authorization: Bearer <token>``.
+    """
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        if token:
+            # We have a bearer token — try to resolve the user from the DB.
+            return token, None, None  # login/id resolved lazily when needed
+    # Fallback: session cookie (works when frontend is same-domain).
+    return (
+        request.session.get("github_oauth_token"),
+        request.session.get("github_user_login"),
+        request.session.get("sentinel_user_id"),
+    )
+
+
+async def _resolve_bearer_user(token: str) -> tuple[str | None, str | None]:
+    """Given a raw GitHub OAuth token, return (github_login, sentinel_user_id).
+
+    Looks up the Users table first; falls back to a live GitHub API call.
+    """
+    if settings.supabase_uses_postgres:
+        try:
+            factory = _get_session_factory()
+            async with factory() as session:
+                result = await session.execute(
+                    select(User).where(User.access_token_encrypted == token)
+                )
+                user_row = result.scalar_one_or_none()
+                if user_row:
+                    return str(user_row.github_login or ""), str(user_row.id)
+        except Exception:
+            pass
+    # Fallback: ask GitHub directly.
+    try:
+        gh_user = await _github_get_authenticated_user(token)
+        return str(gh_user.get("login", "")), None
+    except Exception:
+        return None, None
+
+
 class AuthorizeReposApiPayload(BaseModel):
     repo_full_names: str | list[str]
     sync_open_prs: bool = True
@@ -1675,8 +1733,11 @@ async def github_auth_callback(
     try:
         token = await _github_exchange_oauth_code(code)
         user = await _github_get_authenticated_user(token)
+        github_login = user.get("login", "unknown")
+
+        # Always persist to session (works for same-domain /ui)
         request.session["github_oauth_token"] = token
-        request.session["github_user_login"] = user.get("login", "unknown")
+        request.session["github_user_login"] = github_login
         request.session["github_user_id"] = str(user.get("id", ""))
 
         if settings.supabase_uses_postgres:
@@ -1688,6 +1749,17 @@ async def github_auth_callback(
                 )
                 if sentinel_user_id is not None:
                     request.session["sentinel_user_id"] = str(sentinel_user_id)
+
+        # Cross-domain redirect: pass token in URL hash so the frontend can
+        # store it in localStorage.  The hash fragment is never sent to the
+        # server, keeping the token out of access logs.
+        if next_url and _is_external_redirect(next_url, request):
+            separator = "#" if "#" not in next_url else "&"
+            fragment = urlencode({"auth_token": token, "github_login": github_login})
+            return RedirectResponse(
+                url=f"{next_url}{separator}{fragment}",
+                status_code=302,
+            )
 
         _set_flash(
             request,
@@ -1863,8 +1935,12 @@ async def authorize_repository_legacy(request: Request):
 @app.get("/api/setup/status")
 async def setup_status(request: Request):
     """Setup metadata for the React quick-start panel."""
-    oauth_token = request.session.get("github_oauth_token")
-    github_login = request.session.get("github_user_login")
+    oauth_token, github_login, _ = _get_oauth_credentials(request)
+
+    # If we got a bearer token but no login, resolve it.
+    if oauth_token and not github_login:
+        github_login, _ = await _resolve_bearer_user(oauth_token)
+
     effective_public_base_url = _effective_public_base_url(request)
 
     return {
@@ -1894,7 +1970,7 @@ async def setup_logout(request: Request):
 @app.post("/api/setup/authorize-repos")
 async def setup_authorize_repositories(request: Request, payload: AuthorizeReposApiPayload):
     """Authorize repositories from React UI and optionally queue open PR scans."""
-    oauth_token = request.session.get("github_oauth_token")
+    oauth_token, _, _ = _get_oauth_credentials(request)
     if not oauth_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1939,7 +2015,12 @@ async def setup_authorize_repositories(request: Request, payload: AuthorizeRepos
         if str(item.get("repo_full_name") or "").strip()
     ]
 
-    sentinel_user_id = _coerce_int(request.session.get("sentinel_user_id"))
+    _, _, _raw_sentinel_id = _get_oauth_credentials(request)
+    sentinel_user_id = _coerce_int(_raw_sentinel_id)
+    # If bearer-token auth, resolve sentinel_user_id from DB.
+    if sentinel_user_id is None and oauth_token:
+        _, resolved_id = await _resolve_bearer_user(str(oauth_token))
+        sentinel_user_id = _coerce_int(resolved_id)
     linked_count = 0
     created_repos = 0
     updated_repos = 0
