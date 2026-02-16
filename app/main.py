@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.config import get_settings
@@ -72,6 +73,19 @@ app.add_middleware(
     secret_key=settings.ui_session_secret,
     same_site="lax",
     https_only=settings.public_base_url.startswith("https://"),
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list({
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        settings.frontend_url.rstrip("/"),
+        settings.public_base_url.rstrip("/"),
+    }),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -862,7 +876,7 @@ def _normalize_repo_names(raw: str | list[str]) -> list[str]:
 
 
 def _safe_next_redirect_url(value: str | None) -> str | None:
-    """Allow local absolute URLs or same-origin relative paths only."""
+    """Allow same-origin relative paths and external HTTPS URLs."""
     if not value:
         return None
     candidate = str(value).strip()
@@ -873,11 +887,11 @@ def _safe_next_redirect_url(value: str | None) -> str | None:
         return candidate
 
     parsed = urlparse(candidate)
-    if parsed.scheme not in {"http", "https"}:
-        return None
-    if parsed.hostname not in {"127.0.0.1", "localhost"}:
-        return None
-    return candidate
+    if parsed.scheme == "https" and parsed.hostname:
+        return candidate
+    if parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}:
+        return candidate
+    return None
 
 
 class AuthorizeReposApiPayload(BaseModel):

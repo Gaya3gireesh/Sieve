@@ -60,9 +60,9 @@ async function fetchJson(path, params = {}, options = {}) {
   // Parse JSON from the body we already read
   const contentType = response.headers.get('content-type') || ''
   if (!contentType.includes('application/json')) return {}
-  
+
   if (!bodyText) return {}
-  
+
   try {
     return JSON.parse(bodyText)
   } catch (e) {
@@ -203,8 +203,8 @@ function App() {
   }
 
   function startGithubConnect() {
-    const returnTo = `${window.location.pathname}${window.location.search}`
-    window.location.href = `/auth/github/start?next=${encodeURIComponent(returnTo)}`
+    const returnTo = `${window.location.origin}${window.location.pathname}${window.location.search}`
+    window.location.href = `${API_BASE}/auth/github/start?next=${encodeURIComponent(returnTo)}`
   }
 
   async function disconnectGithub() {

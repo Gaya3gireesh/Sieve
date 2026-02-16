@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     supabase_http_timeout_sec: float = 6.0
     supabase_probe_rest_table: bool = False
     public_base_url: str = "http://127.0.0.1:8000"
+    frontend_url: str = "http://localhost:5173"
     ui_session_secret: str = "sentinel-dev-session-secret"
     use_celery_worker: bool = True
 
