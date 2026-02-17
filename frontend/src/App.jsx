@@ -191,6 +191,7 @@ function App() {
         connected: true,
         github_login: creds.login,
         loading: false,
+        visible_repositories: prev.visible_repositories || []
       }))
     }
     loadSetupStatus()
@@ -329,6 +330,21 @@ function App() {
   ]
 
   // Render Helpers
+  const renderRepoGrid = () => {
+    if (setup.loading) {
+      return <div style={{ color: 'var(--text-muted)' }}>Loading repositories...</div>
+    }
+    if (Array.isArray(setup.visible_repositories) && setup.visible_repositories.length > 0) {
+      return setup.visible_repositories.map((r) => (
+        <button key={r.full_name} className="repo-card" onClick={() => { setRepoFilter(r.full_name); setFilterInput(r.full_name); setActiveTab('queue'); setSelected(null); }}>
+          <div className="repo-card-title">{r.full_name}</div>
+          <div className="repo-card-sub">{r.description || r.full_name}</div>
+        </button>
+      ))
+    }
+    return <div style={{ color: 'var(--text-muted)' }}>No repositories available. Try refreshing or connecting a different account.</div>
+  }
+
   const renderSidebar = () => (
     <aside className="sidebar">
       <div className="sidebar-header">
@@ -371,27 +387,36 @@ function App() {
             <button onClick={loadSetupStatus} className="btn-icon" title="Refresh List" style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', fontSize: '0.8rem', padding: 0 }}>↻</button>
           </div>
 
-          {setup.loading ? (
-            <div style={{ color: '#94a3b8', fontSize: '0.85rem', fontStyle: 'italic' }}>Loading...</div>
-          ) : Array.isArray(setup.visible_repositories) && setup.visible_repositories.length > 0 ? (
-            <div className="repo-list">
-              {setup.visible_repositories.slice(0, 15).map((r) => (
-                <button
-                  key={r.full_name}
-                  className="repo-item"
-                  onClick={() => { setRepoFilter(r.full_name); setFilterInput(r.full_name); setActiveTab('queue'); setSelected(null); }}
-                  title={r.full_name}
-                >
-                  <span className="repo-name">{r.full_name.split('/')[1]}</span>
-                </button>
-              ))}
-              {setup.visible_repositories.length > 15 && <div style={{ fontSize: '0.75rem', color: '#64748b', padding: '0.5rem' }}>+ {setup.visible_repositories.length - 15} more</div>}
-            </div>
-          ) : (
-            <div style={{ color: '#64748b', fontSize: '0.85rem' }}>
-              {setup.connected ? 'No active repositories found.' : <button onClick={startGithubConnect} className="link-button" style={{ color: '#6366f1', background: 'none', border: 'none', padding: 0, textDecoration: 'underline', cursor: 'pointer' }}>Connect to see repositories</button>}
-            </div>
-          )}
+          <div className="repo-list-container">
+            {setup.loading && <div style={{ color: '#94a3b8', fontSize: '0.85rem', fontStyle: 'italic' }}>Loading...</div>}
+
+            {!setup.loading && Array.isArray(setup.visible_repositories) && setup.visible_repositories.length > 0 && (
+              <div className="repo-list">
+                {setup.visible_repositories.slice(0, 15).map((r) => (
+                  <button
+                    key={r.full_name}
+                    className="repo-item"
+                    onClick={() => { setRepoFilter(r.full_name); setFilterInput(r.full_name); setActiveTab('queue'); setSelected(null); }}
+                    title={r.full_name}
+                  >
+                    <span className="repo-name">{r.full_name.split('/')[1]}</span>
+                  </button>
+                ))}
+                {setup.visible_repositories.length > 15 && <div style={{ fontSize: '0.75rem', color: '#64748b', padding: '0.5rem' }}>+ {setup.visible_repositories.length - 15} more</div>}
+              </div>
+            )}
+
+            {!setup.loading && (!setup.visible_repositories || setup.visible_repositories.length === 0) && (
+              <div style={{ color: '#64748b', fontSize: '0.85rem' }}>
+                No active repositories found.
+                {!setup.connected && (
+                  <button onClick={startGithubConnect} className="link-button" style={{ display: 'block', marginTop: '0.5rem', color: '#6366f1', background: 'none', border: 'none', padding: 0, textDecoration: 'underline', cursor: 'pointer' }}>
+                    Connect to GitHub
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </nav>
       <div className="sidebar-footer">
@@ -439,21 +464,93 @@ function App() {
               <div className="score-box">
                 <div style={{ color: '#64748b', fontSize: '0.85rem', marginBottom: '0.5rem' }}>SPAM SCORE</div>
                 <strong style={{ color: selected.analysis.spam_score > 50 ? '#ef4444' : '#10b981' }}>
-                  {selected.analysis.spam_score ?? '—'}
+                  {selected.analysis.spam_score}
                 </strong>
               </div>
               <div className="score-box">
                 <div style={{ color: '#64748b', fontSize: '0.85rem', marginBottom: '0.5rem' }}>QUALITY SCORE</div>
-                <strong>{selected.analysis.quality_score ?? '—'}</strong>
+                <strong>{selected.analysis.quality_score}</strong>
               </div>
             </div>
 
             <div className="analysis-item">
               <h4>Verdict Reason</h4>
-              <p>{selected.analysis.verdict_reason || 'No specific reason provided.'}</p>
+              <p>{selected.analysis.verdict_reason}</p>
+            </div>
+
+            <div className="analysis-item">
+              <h4>Quality Issues</h4>
+              {selected.analysis.quality_issues && selected.analysis.quality_issues.length > 0 ? (
+                <ul style={{ paddingLeft: '1.2rem', color: '#64748b' }}>
+                  {selected.analysis.quality_issues.map((issue, idx) => (
+                    <li key={idx}>{issue}</li>
+                  ))}
+                </ul>
+              ) : <span style={{ color: '#94a3b8', fontStyle: 'italic' }}>None</span>}
+            </div>
+
+            <div className="analysis-item">
+              <h4>Policy Violations</h4>
+              {selected.analysis.policy_violations && selected.analysis.policy_violations.length > 0 ? (
+                <ul style={{ paddingLeft: '1.2rem', color: '#ef4444' }}>
+                  {selected.analysis.policy_violations.map((violation, idx) => (
+                    <li key={idx}>{violation}</li>
+                  ))}
+                </ul>
+              ) : <span style={{ color: '#94a3b8', fontStyle: 'italic' }}>None</span>}
             </div>
           </div>
         )}
+        {/* System Actions, Comments and Inferences */}
+        <div style={{ marginTop: '1.5rem' }}>
+          <h4 style={{ marginBottom: '0.75rem', color: '#334155' }}>System Activity & Comments</h4>
+
+          {selected.system_actions && selected.system_actions.length > 0 ? (
+            <div className="timeline">
+              {selected.system_actions.map((act, i) => (
+                <div key={i} className="action-item">
+                  <div className="action-meta">
+                    <strong className="action-type">{act.type}</strong>
+                    <span className="action-time">{prettyDate(act.timestamp)}</span>
+                  </div>
+                  <div className="action-body">{act.summary || act.detail || act.message}</div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ color: '#94a3b8', fontStyle: 'italic' }}>No recorded system actions for this PR.</div>
+          )}
+
+          {selected.system_comments && selected.system_comments.length > 0 && (
+            <div style={{ marginTop: '1rem' }}>
+              <h5 style={{ marginBottom: '0.5rem' }}>Comments added by system</h5>
+              <div className="comment-list">
+                {selected.system_comments.map((c, idx) => (
+                  <div key={idx} className="comment-box">
+                    <div className="comment-meta"><strong>System</strong> · <small>{prettyDate(c.created_at)}</small></div>
+                    <div className="comment-body">{c.body}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {selected.inferences && selected.inferences.length > 0 && (
+            <div style={{ marginTop: '1rem' }}>
+              <h5 style={{ marginBottom: '0.5rem' }}>Inferences</h5>
+              <ul className="inference-list">
+                {selected.inferences.map((inf, idx) => <li key={idx}>{inf}</li>)}
+              </ul>
+            </div>
+          )}
+
+          {selected.actions_summary && (
+            <div style={{ marginTop: '1rem' }}>
+              <h5 style={{ marginBottom: '0.5rem' }}>Actions Summary</h5>
+              <div style={{ color: '#475569' }}>{selected.actions_summary}</div>
+            </div>
+          )}
+        </div>
       </article>
     )
   }
@@ -461,158 +558,134 @@ function App() {
   return (
     <div className="app-shell">
       {renderSidebar()}
-
       <main className="main-content">
-        {/* Top Header */}
-        <header className="top-bar">
-          <div className="page-title">
-            <h1>Dashboard</h1>
-            <p>Overview of your repository security status.</p>
-          </div>
-
-          <div className="filter-bar">
-            <span style={{ padding: '0.5rem', color: '#94a3b8' }}>🔍</span>
-            <input
-              type="text"
-              placeholder="Filter by repo..."
-              className="search-input"
-              value={filterInput}
-              onChange={(e) => {
-                setFilterInput(e.target.value)
-                setRepoFilter(e.target.value)
-              }}
-            />
-          </div>
-        </header>
-
-        {error && (
-          <div className="alert alert-error" style={{ marginBottom: '1.5rem', padding: '1rem', background: '#fee2e2', color: '#991b1b', borderRadius: '0.5rem', border: '1px solid #fecaca' }}>
-            {error}
-            <button onClick={() => setError('')} style={{ float: 'right', background: 'none', border: 'none', cursor: 'pointer', color: 'inherit' }}>✕</button>
-          </div>
-        )}
-
-        {/* Quick Actions (Collapsible or just standard panel) */}
-        {!setup.connected || quickMessage || quickFailures.length > 0 || setup.oauth_enabled === false ? (
-          <section className="quick-panel">
-            <div className="quick-header">
-              <h3>Quick Setup & Actions</h3>
-              {setup.connected ?
-                <span className="badge badge-success">Connected as {setup.github_login}</span> :
-                <span className="badge badge-warning">Not Connected</span>}
+        {/* If not connected, show prominent connect page */}
+        {!setup.connected ? (
+          <div className="connect-page">
+            <div className="connect-card">
+              <h1>Connect your GitHub account</h1>
+              <p style={{ color: 'var(--text-muted)', marginTop: '0.5rem' }}>Connect to GitHub to view and manage repositories.</p>
+              <div style={{ marginTop: '1.25rem', display: 'flex', gap: '1rem' }}>
+                <button onClick={startGithubConnect} className="btn btn-primary">Connect to GitHub</button>
+                <button onClick={loadSetupStatus} className="btn btn-ghost">Check status</button>
+              </div>
             </div>
+          </div>
+        ) : (
+          <>
+            {/* If no repo selected, show repo picker */}
+            {!repoFilter ? (
+              <div className="repo-selection">
+                <header className="top-bar">
+                  <div className="page-title">
+                    <h1>Select a repository</h1>
+                    <p>Choose a repository to view its dashboard and PRs.</p>
+                  </div>
+                </header>
 
-            <div className="quick-body">
-              {!setup.connected && (
-                <div style={{ marginBottom: '1rem' }}>
-                  <p style={{ marginBottom: '0.5rem' }}>Connect your GitHub account to start managing repositories.</p>
-                  <button onClick={startGithubConnect} disabled={!setup.oauth_enabled || quickBusy} className="btn btn-primary">Connect with GitHub</button>
-                  {!setup.oauth_enabled && <p style={{ color: 'red', fontSize: '0.85rem', marginTop: '0.5rem' }}>OAuth not configured in backend.</p>}
-                </div>
-              )}
+                <section className="repo-grid">
+                  {renderRepoGrid()}
+                </section>
+              </div>
+            ) : (
+              <>
+                {/* Top Header */}
+                <header className="top-bar">
+                  <div className="page-title">
+                    <h1>{repoFilter}</h1>
+                    <p>Repository dashboard — PR queue, status and details.</p>
+                  </div>
 
-              {setup.connected && (
-                <form onSubmit={authorizeAndRun} className="quick-form-grid">
-                  <div className="form-group">
-                    <label>Add / Scan Repositories (owner/repo per line)</label>
-                    <textarea
-                      className="form-input-area"
-                      rows="2"
-                      placeholder="owner/repo-name"
-                      value={quickRepoInput}
-                      onChange={(e) => setQuickRepoInput(e.target.value)}
+                  <div className="filter-bar">
+                    <span style={{ padding: '0.5rem', color: '#94a3b8' }}>🔍</span>
+                    <input
+                      type="text"
+                      placeholder="Filter by repo..."
+                      className="search-input"
+                      value={filterInput}
+                      onChange={(e) => {
+                        setFilterInput(e.target.value)
+                        setRepoFilter(e.target.value)
+                      }}
                     />
                   </div>
-                  <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.9rem', cursor: 'pointer' }}>
-                      <input type="checkbox" checked={syncOpenPrs} onChange={(e) => setSyncOpenPrs(e.target.checked)} />
-                      Scan open PRs immediately
-                    </label>
-                    <button type="submit" className="btn btn-primary" disabled={quickBusy}>
-                      {quickBusy ? 'Processing...' : 'Authorize & Run Scan'}
-                    </button>
-                    <button type="button" className="btn btn-ghost" onClick={disconnectGithub} disabled={quickBusy}>Disconnect</button>
+                </header>
+
+                {error && (
+                  <div className="alert alert-error" style={{ marginBottom: '1.5rem', padding: '1rem', background: '#fee2e2', color: '#991b1b', borderRadius: '0.5rem', border: '1px solid #fecaca' }}>
+                    {error}
+                    <button onClick={() => setError('')} style={{ float: 'right', background: 'none', border: 'none', cursor: 'pointer', color: 'inherit' }}>✕</button>
                   </div>
-                </form>
-              )}
-
-              {quickMessage && <div className="badge badge-info" style={{ marginTop: '1rem', display: 'block' }}>{quickMessage}</div>}
-              {quickFailures.length > 0 && (
-                <div style={{ marginTop: '1rem', color: '#991b1b', fontSize: '0.9rem' }}>
-                  <strong>Failed to process:</strong>
-                  <ul style={{ paddingLeft: '1.5rem', marginTop: '0.5rem' }}>
-                    {quickFailures.map((f, i) => <li key={i}>{f}</li>)}
-                  </ul>
-                </div>
-              )}
-            </div>
-          </section>
-        ) : null}
-
-        {/* Stats Grid */}
-        <section className="stats-grid">
-          {statCards.map((card) => (
-            <article key={card.key} className="stat-card">
-              <p className="stat-label">{card.label}</p>
-              <strong className="stat-value">
-                {loading.stats ? (
-                  <span className="skeleton-text" style={{ display: 'inline-block', width: '2rem', height: '1.5rem', background: '#e2e8f0', borderRadius: '0.25rem' }}></span>
-                ) : (
-                  stats?.[card.key] ?? 0
                 )}
-              </strong>
-            </article>
-          ))}
-        </section>
 
-        {/* Main Content Split */}
-        <section className="content-split">
-          <div className="list-card">
-            <div className="list-header">
-              <h3>{TAB_CONFIG[activeTab].label}</h3>
-              {listLoadingState && <span className="badge badge-default">Refreshing...</span>}
-            </div>
-
-            <div className="list-scroll-area">
-              {listLoadingState ? (
-                <div className="loading-overlay">
-                  <div className="spinner"></div>
-                  <p>Loading...</p>
-                </div>
-              ) : activeItems.length === 0 ? (
-                <div className="empty-state">
-                  <span style={{ fontSize: '2rem', marginBottom: '1rem' }}>{TAB_CONFIG[activeTab].icon}</span>
-                  <p>{TAB_CONFIG[activeTab].empty}</p>
-                </div>
-              ) : (
-                <div>
-                  {activeItems.map((item) => (
-                    <div
-                      key={item.id}
-                      className={`list-item ${selected && selected.id === item.id ? 'selected' : ''}`}
-                      onClick={() => openDetail(item.id)}
-                    >
-                      <div className="item-main">
-                        <strong>{item.repo_full_name} #{item.pr_number}</strong>
-                        <p>{item.pr_title}</p>
-                        <span className={`badge ${getVerdictBadgeClass(item.verdict)}`} style={{ marginTop: '0.5rem' }}>
-                          {verdictLabel(item.verdict)}
-                        </span>
-                      </div>
-                      <div className="item-meta">
-                        <small className="item-date">{prettyDate(item.updated_at || item.created_at)}</small>
-                      </div>
-                    </div>
+                {/* Stats Grid */}
+                <section className="stats-grid">
+                  {statCards.map((card) => (
+                    <article key={card.key} className="stat-card">
+                      <p className="stat-label">{card.label}</p>
+                      <strong className="stat-value">
+                        {loading.stats ? (
+                          <span className="skeleton-text" style={{ display: 'inline-block', width: '2rem', height: '1.5rem', background: '#e2e8f0', borderRadius: '0.25rem' }}></span>
+                        ) : (
+                          stats?.[card.key]
+                        )}
+                      </strong>
+                    </article>
                   ))}
-                </div>
-              )}
-            </div>
-          </div>
+                </section>
 
-          <aside className="detail-card">
-            {renderSelectedDetail()}
-          </aside>
-        </section>
+                {/* Main Content Split */}
+                <section className="content-split">
+                  <div className="list-card">
+                    <div className="list-header">
+                      <h3>{TAB_CONFIG[activeTab].label}</h3>
+                      {listLoadingState && <span className="badge badge-default">Refreshing...</span>}
+                    </div>
+
+                    <div className="list-scroll-area">
+                      {listLoadingState ? (
+                        <div className="loading-overlay">
+                          <div className="spinner"></div>
+                          <p>Loading...</p>
+                        </div>
+                      ) : activeItems.length === 0 ? (
+                        <div className="empty-state">
+                          <span style={{ fontSize: '2rem', marginBottom: '1rem' }}>{TAB_CONFIG[activeTab].icon}</span>
+                          <p>{TAB_CONFIG[activeTab].empty}</p>
+                        </div>
+                      ) : (
+                        <div>
+                          {activeItems.map((item) => (
+                            <div
+                              key={item.id}
+                              className={`list-item ${selected && selected.id === item.id ? 'selected' : ''}`}
+                              onClick={() => openDetail(item.id)}
+                            >
+                              <div className="item-main">
+                                <strong>{item.repo_full_name} #{item.pr_number}</strong>
+                                <p>{item.pr_title}</p>
+                                <span className={`badge ${getVerdictBadgeClass(item.verdict)}`} style={{ marginTop: '0.5rem' }}>
+                                  {verdictLabel(item.verdict)}
+                                </span>
+                              </div>
+                              <div className="item-meta">
+                                <small className="item-date">{prettyDate(item.updated_at || item.created_at)}</small>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <aside className="detail-card">
+                    {renderSelectedDetail()}
+                  </aside>
+                </section>
+              </>
+            )}
+          </>
+        )}
       </main>
     </div>
   )

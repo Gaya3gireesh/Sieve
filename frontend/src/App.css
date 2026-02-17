@@ -552,6 +552,71 @@ body {
   margin-bottom: 2rem;
 }
 
+/* ── System Activity / Comments / Inferences ── */
+.timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.action-item {
+  background: #ffffff;
+  border: 1px solid var(--border-color);
+  padding: 0.75rem 1rem;
+  border-radius: 0.6rem;
+}
+
+.action-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: baseline;
+  margin-bottom: 0.35rem;
+}
+
+.action-type {
+  color: var(--primary-color);
+  font-weight: 700;
+}
+
+.action-time {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.action-body {
+  color: #475569;
+  font-size: 0.95rem;
+}
+
+.comment-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.comment-box {
+  background: #f8fafc;
+  border: 1px solid var(--border-color);
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+}
+
+.comment-meta {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  margin-bottom: 0.45rem;
+}
+
+.comment-body {
+  color: #0f172a;
+}
+
+.inference-list {
+  padding-left: 1.2rem;
+  color: #475569;
+}
+
 .score-box {
   background: #f8fafc;
   border: 1px solid var(--border-color);
@@ -629,4 +694,51 @@ body {
     display: none;
     /* Hide profile in mobile header to save space, relies on quick actions */
   }
+}
+
+/* Connect page */
+.connect-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4rem 1rem;
+}
+.connect-card {
+  background: white;
+  border: 1px solid var(--border-color);
+  padding: 2.25rem;
+  border-radius: 1rem;
+  box-shadow: 0 10px 25px rgba(2,6,23,0.06);
+  text-align: center;
+  max-width: 620px;
+}
+
+/* Repo selection grid */
+.repo-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.repo-card {
+  background: white;
+  border: 1px solid var(--border-color);
+  padding: 1rem;
+  border-radius: 0.75rem;
+  text-align: left;
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+.repo-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 12px 24px rgba(2,6,23,0.06);
+}
+.repo-card-title {
+  font-weight: 700;
+  color: #0f172a;
+}
+.repo-card-sub {
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  margin-top: 0.35rem;
 }
