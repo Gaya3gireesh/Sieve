@@ -1943,6 +1943,39 @@ async def setup_status(request: Request):
 
     effective_public_base_url = _effective_public_base_url(request)
 
+    # Fetch visible repositories if connected
+    visible_repositories: list[dict[str, Any]] = []
+    if oauth_token:
+        try:
+            visible_repositories = await _github_list_repositories(str(oauth_token))
+        except Exception:
+            pass
+
+    # Also fetch managed repos from DB
+    managed_repositories: list[dict[str, Any]] = []
+    if settings.supabase_uses_postgres:
+        try:
+            async with _dashboard_db_session() as db:
+                repo_rows = (
+                    await db.execute(
+                        select(Repository)
+                        .where(Repository.is_active.is_(True))
+                        .order_by(Repository.updated_at.desc())
+                        .limit(50)
+                    )
+                ).scalars().all()
+                managed_repositories = [
+                    {
+                        "full_name": row.full_name,
+                        "owner_user_id": row.owner_user_id,
+                        "installation_id": int(row.installation_id) if row.installation_id else 0,
+                        "is_active": bool(row.is_active),
+                    }
+                    for row in repo_rows
+                ]
+        except Exception:
+            pass
+
     return {
         "oauth_enabled": settings.github_oauth_enabled,
         "connected": bool(oauth_token and github_login),
@@ -1951,7 +1984,152 @@ async def setup_status(request: Request):
         "webhook_target_public": _is_public_https_base_url(effective_public_base_url),
         "connect_path": "/auth/github/start",
         "disconnect_path": "/auth/github/logout",
+        "visible_repositories": visible_repositories,
+        "managed_repositories": managed_repositories,
     }
+
+
+@app.get("/api/repos/list")
+async def list_repositories(request: Request):
+    """List GitHub repositories for the authenticated user."""
+    oauth_token, github_login, _ = _get_oauth_credentials(request)
+    if not oauth_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Connect GitHub first to list repositories.",
+        )
+
+    if oauth_token and not github_login:
+        github_login, _ = await _resolve_bearer_user(oauth_token)
+
+    try:
+        github_repos = await _github_list_repositories(str(oauth_token))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not list GitHub repositories: {exc}",
+        )
+
+    # Enrich with managed status from DB
+    managed_names: set[str] = set()
+    if settings.supabase_uses_postgres:
+        try:
+            async with _dashboard_db_session() as db:
+                repo_rows = (
+                    await db.execute(
+                        select(Repository.full_name)
+                        .where(Repository.is_active.is_(True))
+                    )
+                ).scalars().all()
+                managed_names = {str(name) for name in repo_rows}
+        except Exception:
+            pass
+
+    enriched: list[dict[str, Any]] = []
+    for repo in github_repos:
+        enriched.append({
+            **repo,
+            "managed": repo.get("full_name", "") in managed_names,
+        })
+
+    return {
+        "github_login": github_login,
+        "repositories": enriched,
+        "total": len(enriched),
+    }
+
+
+@app.get("/api/repos/{repo_full_name:path}/dashboard")
+async def repository_dashboard(repo_full_name: str, request: Request):
+    """Full dashboard data for a single repository."""
+    oauth_token, _, _ = _get_oauth_credentials(request)
+
+    result: dict[str, Any] = {
+        "repo_full_name": repo_full_name,
+        "stats": {
+            "queue_pending": 0,
+            "reviewed_approved": 0,
+            "spam_closed": 0,
+            "total_scans": 0,
+        },
+        "pending": [],
+        "reviewed": [],
+        "spam_closed": [],
+    }
+
+    if not settings.supabase_uses_postgres:
+        return result
+
+    async with _dashboard_db_session() as db:
+        # Verdict counts
+        verdict_counts_stmt = (
+            select(PRScan.verdict, func.count(PRScan.id))
+            .where(PRScan.repo_full_name == repo_full_name)
+            .group_by(PRScan.verdict)
+        )
+        verdict_rows = (await db.execute(verdict_counts_stmt)).all()
+        verdict_counts: dict[str, int] = {}
+        for verdict, count in verdict_rows:
+            value = verdict.value if isinstance(verdict, Verdict) else str(verdict)
+            verdict_counts[value] = int(count)
+
+        pending = verdict_counts.get(Verdict.PENDING.value, 0)
+        reviewed = verdict_counts.get(Verdict.PASSED.value, 0)
+        failed = verdict_counts.get(Verdict.FAILED.value, 0)
+        soft_fail = verdict_counts.get(Verdict.SOFT_FAIL.value, 0)
+
+        total_scans_stmt = (
+            select(func.count(PRScan.id))
+            .where(PRScan.repo_full_name == repo_full_name)
+        )
+        total_scans = int((await db.scalar(total_scans_stmt)) or 0)
+
+        result["stats"] = {
+            "queue_pending": pending,
+            "reviewed_approved": reviewed,
+            "spam_closed": failed + soft_fail,
+            "auto_closed": failed,
+            "needs_clarification": soft_fail,
+            "total_scans": total_scans,
+        }
+
+        # Pending PRs
+        pending_scans = (
+            await db.execute(
+                select(PRScan)
+                .where(PRScan.repo_full_name == repo_full_name, PRScan.verdict == Verdict.PENDING)
+                .order_by(PRScan.created_at.desc())
+                .limit(50)
+            )
+        ).scalars().all()
+        result["pending"] = [_scan_to_response(scan) for scan in pending_scans]
+
+        # Reviewed PRs
+        reviewed_scans = (
+            await db.execute(
+                select(PRScan)
+                .where(PRScan.repo_full_name == repo_full_name, PRScan.verdict == Verdict.PASSED)
+                .order_by(PRScan.created_at.desc())
+                .limit(50)
+            )
+        ).scalars().all()
+        result["reviewed"] = [_scan_to_response(scan) for scan in reviewed_scans]
+
+        # Spam/Closed PRs
+        spam_scans = (
+            await db.execute(
+                select(PRScan)
+                .where(
+                    PRScan.repo_full_name == repo_full_name,
+                    PRScan.verdict.in_([Verdict.FAILED, Verdict.SOFT_FAIL]),
+                )
+                .order_by(PRScan.created_at.desc())
+                .limit(50)
+            )
+        ).scalars().all()
+        result["spam_closed"] = [_scan_to_response(scan) for scan in spam_scans]
+
+    return result
 
 
 @app.post("/api/setup/logout")

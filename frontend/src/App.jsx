@@ -1,10 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useCallback } from 'react'
 import './App.css'
 
 const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
-console.log('API_BASE:', API_BASE)
 
-// ── Cross-domain OAuth token helpers ────────────────────────────────────
+// ── Auth Token Helpers ──────────────────────────────────────────────────────
 function getSavedAuthToken() {
   return localStorage.getItem('sentinel_auth_token') || ''
 }
@@ -20,7 +19,6 @@ function clearAuthCredentials() {
   localStorage.removeItem('sentinel_github_login')
 }
 
-/** Parse auth credentials from URL hash after OAuth redirect. */
 function consumeHashCredentials() {
   const hash = window.location.hash
   if (!hash || !hash.includes('auth_token=')) return null
@@ -28,42 +26,19 @@ function consumeHashCredentials() {
   const token = params.get('auth_token')
   const login = params.get('github_login')
   if (!token) return null
-  // Clear the hash so the token doesn't linger in the URL / browser history.
   window.history.replaceState(null, '', window.location.pathname + window.location.search)
   return { token, login: login || 'unknown' }
 }
 
-const TAB_CONFIG = {
-  queue: {
-    label: 'Pending Queue',
-    endpoint: '/api/prs/queue',
-    empty: 'No PRs are currently in analysis queue.',
-    icon: '⏳'
-  },
-  reviewed: {
-    label: 'Reviewed & Approved',
-    endpoint: '/api/prs/reviewed',
-    empty: 'No approved PRs yet.',
-    icon: '✅'
-  },
-  spam: {
-    label: 'Spam / Closed',
-    endpoint: '/api/prs/spam-closed',
-    empty: 'No spam or auto-closed PRs yet.',
-    icon: '🚫'
-  },
-}
-
+// ── API Fetcher ─────────────────────────────────────────────────────────────
 async function fetchJson(path, params = {}, options = {}) {
   const query = new URLSearchParams()
   Object.entries(params).forEach(([key, value]) => {
     if (value === undefined || value === null || value === '') return
     query.set(key, String(value))
   })
-
   const url = `${API_BASE}${path}${query.size ? `?${query.toString()}` : ''}`
 
-  // Build headers, injecting Bearer token when stored locally (cross-domain).
   const headers = { ...(options.headers || {}) }
   const savedToken = getSavedAuthToken()
   if (savedToken && !headers['Authorization']) {
@@ -77,12 +52,7 @@ async function fetchJson(path, params = {}, options = {}) {
   })
 
   let bodyText = ''
-  try {
-    bodyText = await response.text()
-  } catch (e) {
-    console.error('Error reading response body:', e)
-    throw new Error(`Request failed (${response.status}): could not read response`)
-  }
+  try { bodyText = await response.text() } catch { throw new Error(`Request failed (${response.status})`) }
 
   if (!response.ok) {
     let message = `Request failed (${response.status})`
@@ -90,9 +60,7 @@ async function fetchJson(path, params = {}, options = {}) {
       try {
         const body = JSON.parse(bodyText)
         message = body.detail || body.message || message
-      } catch {
-        message = bodyText
-      }
+      } catch { message = bodyText }
     }
     throw new Error(message)
   }
@@ -100,595 +68,680 @@ async function fetchJson(path, params = {}, options = {}) {
   const contentType = response.headers.get('content-type') || ''
   if (!contentType.includes('application/json')) return {}
   if (!bodyText) return {}
-
-  try {
-    return JSON.parse(bodyText)
-  } catch (e) {
-    console.error('Error parsing JSON response:', e)
-    return {}
-  }
+  try { return JSON.parse(bodyText) } catch { return {} }
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────────
 function prettyDate(isoString) {
-  if (!isoString) return 'Unknown'
+  if (!isoString) return '—'
   const date = new Date(isoString)
-  if (Number.isNaN(date.getTime())) return 'Unknown'
-  return date.toLocaleString(undefined, {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
-  })
+  if (Number.isNaN(date.getTime())) return '—'
+  return date.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
-function formatPercent(value) {
-  if (value === undefined || value === null || Number.isNaN(Number(value))) return 'N/A'
-  const n = Number(value)
-  const pct = n <= 1 ? n * 100 : n
-  return `${pct.toFixed(1)}%`
-}
-
-function verdictLabel(verdict) {
-  return String(verdict || 'unknown').replaceAll('_', ' ')
+function getVerdictClass(verdict) {
+  const v = (verdict || '').toLowerCase()
+  if (v === 'passed' || v.includes('approve') || v.includes('legit')) return 'approved'
+  if (v === 'failed' || v.includes('spam')) return 'spam'
+  if (v === 'soft_fail') return 'spam'
+  return 'pending'
 }
 
 function getVerdictBadgeClass(verdict) {
   const v = (verdict || '').toLowerCase()
-  if (v.includes('approve') || v.includes('legit')) return 'badge-success'
-  if (v.includes('spam')) return 'badge-error'
-  if (v.includes('clarification')) return 'badge-warning'
-  return 'badge-default'
+  if (v === 'passed') return 'verdict-passed'
+  if (v === 'failed') return 'verdict-failed'
+  if (v === 'soft_fail') return 'verdict-soft-fail'
+  return 'verdict-pending'
 }
 
-function App() {
-  const [activeTab, setActiveTab] = useState('queue')
-  const [filterInput, setFilterInput] = useState('')
-  const [repoFilter, setRepoFilter] = useState('')
-  const [stats, setStats] = useState(null)
-  const [itemsByTab, setItemsByTab] = useState({ queue: [], reviewed: [], spam: [] })
+function getVerdictIcon(verdict) {
+  const v = (verdict || '').toLowerCase()
+  if (v === 'passed') return '✓'
+  if (v === 'failed') return '✕'
+  if (v === 'soft_fail') return '⚠'
+  return '◷'
+}
 
-  // Refined loading states
-  const [loading, setLoading] = useState({ stats: true, list: false, detail: false })
-  // Track specific list loading to prevent stale data display
-  const [listLoadingState, setListLoadingState] = useState(false)
+// ── GitHub SVG Icon ─────────────────────────────────────────────────────────
+function GitHubIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22">
+      <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+    </svg>
+  )
+}
 
-  const [selected, setSelected] = useState(null)
-  const [error, setError] = useState('')
 
-  const [refreshTick, setRefreshTick] = useState(0)
-  const [setup, setSetup] = useState({
-    loading: true,
-    oauth_enabled: false,
-    connected: false,
-    github_login: null,
-    webhook_target: '',
-    webhook_target_public: false,
-    visible_repositories: [],
-  })
-
-  // Quick run state
-  const [quickRepoInput, setQuickRepoInput] = useState('')
-  const [syncOpenPrs, setSyncOpenPrs] = useState(true)
-  const [quickBusy, setQuickBusy] = useState(false)
-  const [quickMessage, setQuickMessage] = useState('')
-  const [quickFailures, setQuickFailures] = useState([])
-
-  // Load Setup Status
-  async function loadSetupStatus() {
-    try {
-      const data = await fetchJson('/api/setup/status')
-      setSetup({ loading: false, ...data })
-    } catch (err) {
-      setSetup((prev) => ({ ...prev, loading: false }))
-      setError(`Setup status error: ${err.message}`)
-    }
-  }
-
-  // Initial Auth Check
-  useEffect(() => {
-    const creds = consumeHashCredentials()
-    if (creds) {
-      saveAuthCredentials(creds.token, creds.login)
-      setSetup((prev) => ({
-        ...prev,
-        connected: true,
-        github_login: creds.login,
-        loading: false,
-        visible_repositories: prev.visible_repositories || []
-      }))
-    }
-    loadSetupStatus()
-  }, [])
-
-  // Load Stats
-  useEffect(() => {
-    let cancelled = false
-    async function loadStats() {
-      setLoading((prev) => ({ ...prev, stats: true }))
-      try {
-        const data = await fetchJson('/api/dashboard/stats', { repo_full_name: repoFilter })
-        if (cancelled) return
-        setStats(data.stats)
-        setError('')
-      } catch (err) {
-        if (cancelled) return
-        setError(`Stats error: ${err.message}`)
-      } finally {
-        if (!cancelled) setLoading((prev) => ({ ...prev, stats: false }))
-      }
-    }
-    loadStats()
-    return () => { cancelled = true }
-  }, [repoFilter, refreshTick])
-
-  // Load List Data (Queue, Reviewed, Spam)
-  useEffect(() => {
-    let cancelled = false
-    async function loadList() {
-      // Clear selection when tab changes to avoid confusion
-      setSelected(null)
-      // Set precise loading state
-      setListLoadingState(true)
-
-      try {
-        const config = TAB_CONFIG[activeTab]
-        const data = await fetchJson(config.endpoint, { limit: 100, repo_full_name: repoFilter })
-        if (cancelled) return
-
-        setItemsByTab((prev) => ({ ...prev, [activeTab]: data.items || [] }))
-        setError('')
-      } catch (err) {
-        if (cancelled) return
-        setError(`List error: ${err.message}`)
-      } finally {
-        if (!cancelled) setListLoadingState(false)
-      }
-    }
-    loadList()
-    return () => { cancelled = true }
-  }, [activeTab, repoFilter, refreshTick])
-
-  const activeItems = useMemo(() => itemsByTab[activeTab] || [], [itemsByTab, activeTab])
-
-  // Open Detail View
-  async function openDetail(scanId) {
-    setLoading((prev) => ({ ...prev, detail: true }))
-    try {
-      const data = await fetchJson(`/api/prs/${scanId}`)
-      setSelected(data)
-      setError('')
-    } catch (err) {
-      setError(`Detail error: ${err.message}`)
-    } finally {
-      setLoading((prev) => ({ ...prev, detail: false }))
-    }
-  }
-
-  // Filter Handling
-  function applyFilter(event) {
-    event.preventDefault()
-    setRepoFilter(filterInput.trim())
-    setSelected(null)
-  }
-
-  // Auth Actions
-  function startGithubConnect() {
+// ═══════════════════════════════════════════════════════════════════════════
+// PAGE 1: Connect to GitHub
+// ═══════════════════════════════════════════════════════════════════════════
+function ConnectPage({ onConnect, oauthEnabled, error }) {
+  function startConnect() {
     const returnTo = `${window.location.origin}${window.location.pathname}${window.location.search}`
     window.location.href = `${API_BASE}/auth/github/start?next=${encodeURIComponent(returnTo)}`
   }
 
-  async function disconnectGithub() {
-    setQuickBusy(true)
-    try {
-      await fetchJson('/api/setup/logout', {}, { method: 'POST' })
-      clearAuthCredentials()
-      setQuickMessage('GitHub disconnected.')
-      setQuickFailures([])
-      await loadSetupStatus()
-    } catch (err) {
-      setError(`Disconnect error: ${err.message}`)
-    } finally {
-      setQuickBusy(false)
-    }
-  }
-
-  // Setup / Run Actions
-  async function authorizeAndRun(event) {
-    event.preventDefault()
-    setQuickMessage('')
-    setQuickFailures([])
-
-    if (!quickRepoInput.trim()) {
-      setError('Enter at least one repository in owner/repo format.')
-      return
-    }
-
-    setQuickBusy(true)
-    try {
-      const data = await fetchJson('/api/setup/authorize-repos', {}, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          repo_full_names: quickRepoInput,
-          sync_open_prs: syncOpenPrs,
-        }),
-      })
-      setQuickMessage(data.message || 'Authorization completed.')
-      setQuickFailures(Array.isArray(data.failures) ? data.failures : [])
-      setError('')
-      setRefreshTick((v) => v + 1)
-      await loadSetupStatus()
-    } catch (err) {
-      setError(`Authorize/run error: ${err.message}`)
-    } finally {
-      setQuickBusy(false)
-    }
-  }
-
-  const statCards = [
-    { key: 'queue_pending', label: 'Pending Review', color: 'text-yellow-600' },
-    { key: 'reviewed_approved', label: 'Approved', color: 'text-green-600' },
-    { key: 'spam_closed', label: 'Spam Detected', color: 'text-red-600' },
-    { key: 'active_repositories', label: 'Active Repos', color: 'text-blue-600' },
-  ]
-
-  // Render Helpers
-  const renderRepoGrid = () => {
-    if (setup.loading) {
-      return <div style={{ color: 'var(--text-muted)' }}>Loading repositories...</div>
-    }
-    if (Array.isArray(setup.visible_repositories) && setup.visible_repositories.length > 0) {
-      return setup.visible_repositories.map((r) => (
-        <button key={r.full_name} className="repo-card" onClick={() => { setRepoFilter(r.full_name); setFilterInput(r.full_name); setActiveTab('queue'); setSelected(null); }}>
-          <div className="repo-card-title">{r.full_name}</div>
-          <div className="repo-card-sub">{r.description || r.full_name}</div>
+  return (
+    <div className="connect-page">
+      <div className="connect-card">
+        <div className="connect-logo">🛡️</div>
+        <h1>Sieve</h1>
+        <p className="subtitle">
+          Intelligent PR gatekeeper. Connect your GitHub account to start
+          filtering pull requests with AI-powered analysis.
+        </p>
+        <button
+          className="github-connect-btn"
+          onClick={startConnect}
+          disabled={!oauthEnabled}
+        >
+          <GitHubIcon />
+          Connect with GitHub
         </button>
-      ))
-    }
-    return <div style={{ color: 'var(--text-muted)' }}>No repositories available. Try refreshing or connecting a different account.</div>
-  }
 
-  const renderSidebar = () => (
-    <aside className="sidebar">
-      <div className="sidebar-header">
-        <span className="brand-logo">🛡️</span>
-        <span className="brand-name">Sentinel</span>
-      </div>
-
-      <div className="user-profile-section">
-        {setup.connected ? (
-          <div className="user-card">
-            <div className="user-avatar-placeholder">{setup.github_login.charAt(0).toUpperCase()}</div>
-            <div className="user-info">
-              <span className="user-name">{setup.github_login}</span>
-              <span className="user-status">● Connected</span>
-            </div>
-          </div>
-        ) : (
-          <div className="user-card disconnected">
-            <div className="user-info">
-              <span className="user-status">○ Guest</span>
-            </div>
+        {!oauthEnabled && (
+          <div className="connect-error-msg">
+            GitHub OAuth is not configured on the backend. Set <code>GITHUB_OAUTH_CLIENT_ID</code> and <code>GITHUB_OAUTH_CLIENT_SECRET</code>.
           </div>
         )}
-      </div>
+        {error && <div className="connect-error-msg">{error}</div>}
 
-      <nav className="sidebar-nav">
-        {Object.entries(TAB_CONFIG).map(([key, tab]) => (
-          <button
-            key={key}
-            className={`nav-item ${activeTab === key ? 'active' : ''}`}
-            onClick={() => setActiveTab(key)}
-          >
-            <span>{tab.icon} {tab.label}</span>
-          </button>
-        ))}
-
-        <div style={{ marginTop: '2rem', padding: '0 1rem', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '1rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-            <h4 style={{ fontSize: '0.75rem', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, margin: 0 }}>Repositories</h4>
-            <button onClick={loadSetupStatus} className="btn-icon" title="Refresh List" style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', fontSize: '0.8rem', padding: 0 }}>↻</button>
+        <div className="connect-features">
+          <div className="connect-feature">
+            <span className="cf-icon">🔍</span>
+            <span className="cf-text">AI-powered PR analysis</span>
           </div>
-
-          <div className="repo-list-container">
-            {setup.loading && <div style={{ color: '#94a3b8', fontSize: '0.85rem', fontStyle: 'italic' }}>Loading...</div>}
-
-            {!setup.loading && Array.isArray(setup.visible_repositories) && setup.visible_repositories.length > 0 && (
-              <div className="repo-list">
-                {setup.visible_repositories.slice(0, 15).map((r) => (
-                  <button
-                    key={r.full_name}
-                    className="repo-item"
-                    onClick={() => { setRepoFilter(r.full_name); setFilterInput(r.full_name); setActiveTab('queue'); setSelected(null); }}
-                    title={r.full_name}
-                  >
-                    <span className="repo-name">{r.full_name.split('/')[1]}</span>
-                  </button>
-                ))}
-                {setup.visible_repositories.length > 15 && <div style={{ fontSize: '0.75rem', color: '#64748b', padding: '0.5rem' }}>+ {setup.visible_repositories.length - 15} more</div>}
-              </div>
-            )}
-
-            {!setup.loading && (!setup.visible_repositories || setup.visible_repositories.length === 0) && (
-              <div style={{ color: '#64748b', fontSize: '0.85rem' }}>
-                No active repositories found.
-                {!setup.connected && (
-                  <button onClick={startGithubConnect} className="link-button" style={{ display: 'block', marginTop: '0.5rem', color: '#6366f1', background: 'none', border: 'none', padding: 0, textDecoration: 'underline', cursor: 'pointer' }}>
-                    Connect to GitHub
-                  </button>
-                )}
-              </div>
-            )}
+          <div className="connect-feature">
+            <span className="cf-icon">🚫</span>
+            <span className="cf-text">Auto-close spam PRs</span>
+          </div>
+          <div className="connect-feature">
+            <span className="cf-icon">📊</span>
+            <span className="cf-text">Quality & effort scoring</span>
           </div>
         </div>
-      </nav>
-      <div className="sidebar-footer">
-        {setup.connected ? (
-          <button onClick={disconnectGithub} className="btn btn-outline-danger full-width" disabled={quickBusy}>
-            Disconnect GitHub
-          </button>
-        ) : (
-          <button onClick={startGithubConnect} className="btn btn-primary full-width">
-            Connect GitHub
-          </button>
-        )}
-        <div className="footer-copy">© 2026 Sieve Security</div>
       </div>
-    </aside>
+    </div>
   )
+}
 
-  const renderSelectedDetail = () => {
-    if (loading.detail) return <div className="loading-overlay"><div className="spinner"></div><p>Loading details...</p></div>
-    if (!selected) return <div className="detail-placeholder">Select an item to view details</div>
-    const isPr = !!selected.pr_number
-    return (
-      <article className="detail-card">
-        <header className="detail-header">
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start' }}>
-            <h2>{isPr ? selected.pr_title : selected.repo_full_name}</h2>
-            <a href={selected.pr_url || `https://github.com/${selected.repo_full_name}`} target="_blank" rel="noreferrer" className="btn btn-secondary btn-sm" style={{ fontSize: '0.8rem' }}>
-              View on GitHub ↗
-            </a>
-          </div>
 
-          <div className="detail-meta-row">
-            <span className={`badge ${getVerdictBadgeClass(selected.verdict)}`}>
-              {selected.verdict}
-            </span>
-            {isPr && <span className="badge badge-default">PR #{selected.pr_number}</span>}
-            <span className="badge badge-default">{prettyDate(selected.created_at)}</span>
-            <span className="badge badge-default">{selected.pr_author}</span>
-          </div>
-        </header>
+// ═══════════════════════════════════════════════════════════════════════════
+// PAGE 2: Repository List
+// ═══════════════════════════════════════════════════════════════════════════
+function ReposPage({ githubLogin, onSelectRepo, onDisconnect }) {
+  const [repos, setRepos] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [search, setSearch] = useState('')
+  const [error, setError] = useState('')
 
-        {selected.analysis && (
-          <div className="analysis-content" style={{ marginTop: '2rem' }}>
-            <div className="scores-grid">
-              <div className="score-box">
-                <div style={{ color: '#64748b', fontSize: '0.85rem', marginBottom: '0.5rem' }}>SPAM SCORE</div>
-                <strong style={{ color: selected.analysis.spam_score > 50 ? '#ef4444' : '#10b981' }}>
-                  {selected.analysis.spam_score}
-                </strong>
-              </div>
-              <div className="score-box">
-                <div style={{ color: '#64748b', fontSize: '0.85rem', marginBottom: '0.5rem' }}>QUALITY SCORE</div>
-                <strong>{selected.analysis.quality_score}</strong>
-              </div>
-            </div>
+  useEffect(() => {
+    async function loadRepos() {
+      setLoading(true)
+      try {
+        // Try the dedicated repos endpoint first
+        const data = await fetchJson('/api/repos/list')
+        setRepos(data.repositories || [])
+        setError('')
+      } catch (err) {
+        // Fallback: try setup status for visible_repositories
+        try {
+          const statusData = await fetchJson('/api/setup/status')
+          setRepos(statusData.visible_repositories || [])
+          setError('')
+        } catch (err2) {
+          setError(`Could not load repositories: ${err.message}`)
+        }
+      } finally {
+        setLoading(false)
+      }
+    }
+    loadRepos()
+  }, [])
 
-            <div className="analysis-item">
-              <h4>Verdict Reason</h4>
-              <p>{selected.analysis.verdict_reason}</p>
-            </div>
-
-            <div className="analysis-item">
-              <h4>Quality Issues</h4>
-              {selected.analysis.quality_issues && selected.analysis.quality_issues.length > 0 ? (
-                <ul style={{ paddingLeft: '1.2rem', color: '#64748b' }}>
-                  {selected.analysis.quality_issues.map((issue, idx) => (
-                    <li key={idx}>{issue}</li>
-                  ))}
-                </ul>
-              ) : <span style={{ color: '#94a3b8', fontStyle: 'italic' }}>None</span>}
-            </div>
-
-            <div className="analysis-item">
-              <h4>Policy Violations</h4>
-              {selected.analysis.policy_violations && selected.analysis.policy_violations.length > 0 ? (
-                <ul style={{ paddingLeft: '1.2rem', color: '#ef4444' }}>
-                  {selected.analysis.policy_violations.map((violation, idx) => (
-                    <li key={idx}>{violation}</li>
-                  ))}
-                </ul>
-              ) : <span style={{ color: '#94a3b8', fontStyle: 'italic' }}>None</span>}
-            </div>
-          </div>
-        )}
-        {/* System Actions, Comments and Inferences */}
-        <div style={{ marginTop: '1.5rem' }}>
-          <h4 style={{ marginBottom: '0.75rem', color: '#334155' }}>System Activity & Comments</h4>
-
-          {selected.system_actions && selected.system_actions.length > 0 ? (
-            <div className="timeline">
-              {selected.system_actions.map((act, i) => (
-                <div key={i} className="action-item">
-                  <div className="action-meta">
-                    <strong className="action-type">{act.type}</strong>
-                    <span className="action-time">{prettyDate(act.timestamp)}</span>
-                  </div>
-                  <div className="action-body">{act.summary || act.detail || act.message}</div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div style={{ color: '#94a3b8', fontStyle: 'italic' }}>No recorded system actions for this PR.</div>
-          )}
-
-          {selected.system_comments && selected.system_comments.length > 0 && (
-            <div style={{ marginTop: '1rem' }}>
-              <h5 style={{ marginBottom: '0.5rem' }}>Comments added by system</h5>
-              <div className="comment-list">
-                {selected.system_comments.map((c, idx) => (
-                  <div key={idx} className="comment-box">
-                    <div className="comment-meta"><strong>System</strong> · <small>{prettyDate(c.created_at)}</small></div>
-                    <div className="comment-body">{c.body}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {selected.inferences && selected.inferences.length > 0 && (
-            <div style={{ marginTop: '1rem' }}>
-              <h5 style={{ marginBottom: '0.5rem' }}>Inferences</h5>
-              <ul className="inference-list">
-                {selected.inferences.map((inf, idx) => <li key={idx}>{inf}</li>)}
-              </ul>
-            </div>
-          )}
-
-          {selected.actions_summary && (
-            <div style={{ marginTop: '1rem' }}>
-              <h5 style={{ marginBottom: '0.5rem' }}>Actions Summary</h5>
-              <div style={{ color: '#475569' }}>{selected.actions_summary}</div>
-            </div>
-          )}
-        </div>
-      </article>
+  const filteredRepos = useMemo(() => {
+    if (!search.trim()) return repos
+    const q = search.toLowerCase()
+    return repos.filter(r =>
+      (r.full_name || '').toLowerCase().includes(q)
     )
-  }
+  }, [repos, search])
 
   return (
-    <div className="app-shell">
-      {renderSidebar()}
-      <main className="main-content">
-        {/* If not connected, show prominent connect page */}
-        {!setup.connected ? (
-          <div className="connect-page">
-            <div className="connect-card">
-              <h1>Connect your GitHub account</h1>
-              <p style={{ color: 'var(--text-muted)', marginTop: '0.5rem' }}>Connect to GitHub to view and manage repositories.</p>
-              <div style={{ marginTop: '1.25rem', display: 'flex', gap: '1rem' }}>
-                <button onClick={startGithubConnect} className="btn btn-primary">Connect to GitHub</button>
-                <button onClick={loadSetupStatus} className="btn btn-ghost">Check status</button>
+    <div className="repos-page">
+      <header className="repos-topbar">
+        <div className="repos-topbar-left">
+          <div className="topbar-logo">🛡️</div>
+          <span className="topbar-brand">Sieve</span>
+        </div>
+        <div className="repos-topbar-right">
+          <div className="user-chip">
+            <span className="avatar-sm">{(githubLogin || '?').charAt(0).toUpperCase()}</span>
+            <span>{githubLogin}</span>
+          </div>
+          <button className="btn-disconnect" onClick={onDisconnect}>Disconnect</button>
+        </div>
+      </header>
+
+      <div className="repos-content">
+        <div className="repos-header">
+          <h1>Your Repositories</h1>
+          <p>Select a repository to view its PR dashboard and analysis details.</p>
+        </div>
+
+        <div className="repos-search-bar">
+          <span className="search-icon">🔍</span>
+          <input
+            type="text"
+            placeholder="Search repositories..."
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+          />
+          <span className="repo-count-chip">{filteredRepos.length} repos</span>
+        </div>
+
+        {error && (
+          <div className="error-banner">
+            <span>{error}</span>
+            <button onClick={() => setError('')}>✕</button>
+          </div>
+        )}
+
+        {loading ? (
+          <div className="repos-loading">
+            <div className="spinner"></div>
+            <span>Loading repositories...</span>
+          </div>
+        ) : filteredRepos.length === 0 ? (
+          <div className="repos-empty">
+            <div className="empty-icon">📦</div>
+            <p>{search ? 'No repositories match your search.' : 'No repositories found. Make sure your GitHub account has accessible repositories.'}</p>
+          </div>
+        ) : (
+          <div className="repos-grid">
+            {filteredRepos.map(repo => (
+              <div
+                key={repo.id || repo.full_name}
+                className="repo-card"
+                onClick={() => onSelectRepo(repo.full_name)}
+              >
+                <div className="repo-card-header">
+                  <div className="repo-icon">📁</div>
+                  <span className={`repo-visibility-badge ${repo.private ? 'private' : 'public'}`}>
+                    {repo.private ? '🔒 Private' : '🌐 Public'}
+                  </span>
+                </div>
+                <div className="repo-name">{(repo.full_name || '').split('/')[1] || repo.full_name}</div>
+                <div className="repo-owner">{(repo.full_name || '').split('/')[0]}</div>
+                <div className="repo-card-footer">
+                  <span className="repo-role-badge">{repo.admin ? 'Admin' : 'Collaborator'}</span>
+                  {repo.managed && <span className="repo-role-badge repo-managed-badge">Managed</span>}
+                </div>
               </div>
-            </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PAGE 3: Repository Dashboard
+// ═══════════════════════════════════════════════════════════════════════════
+function DashboardPage({ repoFullName, onBack, githubLogin }) {
+  const [dashboard, setDashboard] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [activeTab, setActiveTab] = useState('pending')
+  const [selectedPR, setSelectedPR] = useState(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
+
+  const loadDashboard = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
+    else setRefreshing(true)
+    try {
+      const data = await fetchJson(`/api/repos/${repoFullName}/dashboard`)
+      setDashboard(data)
+      setError('')
+    } catch (err) {
+      setError(`Failed to load dashboard: ${err.message}`)
+    } finally {
+      if (!silent) setLoading(false)
+      setRefreshing(false)
+    }
+  }, [repoFullName])
+
+  useEffect(() => {
+    loadDashboard()
+    setSelectedPR(null)
+    setActiveTab('pending')
+  }, [repoFullName, loadDashboard])
+
+  async function openDetail(scanId) {
+    setDetailLoading(true)
+    try {
+      const data = await fetchJson(`/api/prs/${scanId}`)
+      setSelectedPR(data)
+    } catch (err) {
+      setError(`Detail error: ${err.message}`)
+    } finally {
+      setDetailLoading(false)
+    }
+  }
+
+  const stats = dashboard?.stats || {}
+  const tabItems = {
+    pending: dashboard?.pending || [],
+    reviewed: dashboard?.reviewed || [],
+    spam_closed: dashboard?.spam_closed || [],
+  }
+  const currentItems = tabItems[activeTab] || []
+
+  const tabs = [
+    { key: 'pending', label: 'In Queue', icon: '⏳', count: stats.queue_pending || 0 },
+    { key: 'reviewed', label: 'Approved', icon: '✅', count: stats.reviewed_approved || 0 },
+    { key: 'spam_closed', label: 'Spam / Closed', icon: '🚫', count: stats.spam_closed || 0 },
+  ]
+
+  return (
+    <div className="dashboard-page">
+      {/* Top Bar */}
+      <header className="dash-topbar">
+        <div className="dash-topbar-left">
+          <button className="btn-back" onClick={onBack}>
+            ← Back
+          </button>
+          <span className="dash-repo-name">{repoFullName}</span>
+        </div>
+        <div className="dash-topbar-right">
+          <button
+            className={`btn-refresh ${refreshing ? 'spinning' : ''}`}
+            onClick={() => loadDashboard(true)}
+            disabled={refreshing}
+          >
+            <span className="refresh-icon">↻</span>
+            {refreshing ? 'Refreshing...' : 'Refresh'}
+          </button>
+          <div className="user-chip">
+            <span className="avatar-sm">{(githubLogin || '?').charAt(0).toUpperCase()}</span>
+            <span>{githubLogin}</span>
+          </div>
+        </div>
+      </header>
+
+      <div className="dash-content">
+        {error && (
+          <div className="error-banner">
+            <span>{error}</span>
+            <button onClick={() => setError('')}>✕</button>
+          </div>
+        )}
+
+        {loading ? (
+          <div className="loading-overlay" style={{ minHeight: '50vh' }}>
+            <div className="spinner"></div>
+            <p>Loading dashboard...</p>
           </div>
         ) : (
           <>
-            {/* If no repo selected, show repo picker */}
-            {!repoFilter ? (
-              <div className="repo-selection">
-                <header className="top-bar">
-                  <div className="page-title">
-                    <h1>Select a repository</h1>
-                    <p>Choose a repository to view its dashboard and PRs.</p>
-                  </div>
-                </header>
-
-                <section className="repo-grid">
-                  {renderRepoGrid()}
-                </section>
+            {/* Stats Row */}
+            <div className="stats-row">
+              <div className="stat-card pending">
+                <div className="stat-label">Pending Review</div>
+                <div className="stat-value">{stats.queue_pending ?? 0}</div>
               </div>
-            ) : (
-              <>
-                {/* Top Header */}
-                <header className="top-bar">
-                  <div className="page-title">
-                    <h1>{repoFilter}</h1>
-                    <p>Repository dashboard — PR queue, status and details.</p>
-                  </div>
+              <div className="stat-card approved">
+                <div className="stat-label">Approved</div>
+                <div className="stat-value">{stats.reviewed_approved ?? 0}</div>
+              </div>
+              <div className="stat-card spam">
+                <div className="stat-label">Spam / Closed</div>
+                <div className="stat-value">{stats.spam_closed ?? 0}</div>
+              </div>
+              <div className="stat-card total">
+                <div className="stat-label">Total Scans</div>
+                <div className="stat-value">{stats.total_scans ?? 0}</div>
+              </div>
+            </div>
 
-                  <div className="filter-bar">
-                    <span style={{ padding: '0.5rem', color: '#94a3b8' }}>🔍</span>
-                    <input
-                      type="text"
-                      placeholder="Filter by repo..."
-                      className="search-input"
-                      value={filterInput}
-                      onChange={(e) => {
-                        setFilterInput(e.target.value)
-                        setRepoFilter(e.target.value)
-                      }}
-                    />
-                  </div>
-                </header>
+            {/* Tabs */}
+            <div className="dash-tabs">
+              {tabs.map(tab => (
+                <button
+                  key={tab.key}
+                  className={`dash-tab ${activeTab === tab.key ? 'active' : ''}`}
+                  onClick={() => { setActiveTab(tab.key); setSelectedPR(null) }}
+                >
+                  {tab.icon} {tab.label}
+                  <span className="tab-count">{tab.count}</span>
+                </button>
+              ))}
+            </div>
 
-                {error && (
-                  <div className="alert alert-error" style={{ marginBottom: '1.5rem', padding: '1rem', background: '#fee2e2', color: '#991b1b', borderRadius: '0.5rem', border: '1px solid #fecaca' }}>
-                    {error}
-                    <button onClick={() => setError('')} style={{ float: 'right', background: 'none', border: 'none', cursor: 'pointer', color: 'inherit' }}>✕</button>
-                  </div>
-                )}
-
-                {/* Stats Grid */}
-                <section className="stats-grid">
-                  {statCards.map((card) => (
-                    <article key={card.key} className="stat-card">
-                      <p className="stat-label">{card.label}</p>
-                      <strong className="stat-value">
-                        {loading.stats ? (
-                          <span className="skeleton-text" style={{ display: 'inline-block', width: '2rem', height: '1.5rem', background: '#e2e8f0', borderRadius: '0.25rem' }}></span>
-                        ) : (
-                          stats?.[card.key]
-                        )}
-                      </strong>
-                    </article>
-                  ))}
-                </section>
-
-                {/* Main Content Split */}
-                <section className="content-split">
-                  <div className="list-card">
-                    <div className="list-header">
-                      <h3>{TAB_CONFIG[activeTab].label}</h3>
-                      {listLoadingState && <span className="badge badge-default">Refreshing...</span>}
+            {/* Content Split */}
+            <div className="dash-split">
+              {/* PR List */}
+              <div className="pr-list-panel">
+                <div className="pr-list-header">
+                  <h3>{tabs.find(t => t.key === activeTab)?.label || 'PRs'}</h3>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{currentItems.length} items</span>
+                </div>
+                <div className="pr-list-scroll">
+                  {currentItems.length === 0 ? (
+                    <div className="pr-empty-state">
+                      <span className="empty-icon">{tabs.find(t => t.key === activeTab)?.icon}</span>
+                      <p>No {tabs.find(t => t.key === activeTab)?.label.toLowerCase()} PRs yet.</p>
                     </div>
+                  ) : (
+                    currentItems.map(item => (
+                      <div
+                        key={item.id}
+                        className={`pr-list-item ${selectedPR?.id === item.id ? 'selected' : ''}`}
+                        onClick={() => openDetail(item.id)}
+                      >
+                        <div className={`pr-item-icon ${getVerdictClass(item.verdict)}`}>
+                          {getVerdictIcon(item.verdict)}
+                        </div>
+                        <div className="pr-item-body">
+                          <div className="pr-item-title">#{item.pr_number} {item.pr_title}</div>
+                          <div className="pr-item-meta">
+                            <span>{item.pr_author || '—'}</span>
+                            <span>·</span>
+                            <span>{(item.verdict || 'pending').replaceAll('_', ' ')}</span>
+                          </div>
+                        </div>
+                        <div className="pr-item-date">{prettyDate(item.updated_at || item.created_at)}</div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
 
-                    <div className="list-scroll-area">
-                      {listLoadingState ? (
-                        <div className="loading-overlay">
-                          <div className="spinner"></div>
-                          <p>Loading...</p>
-                        </div>
-                      ) : activeItems.length === 0 ? (
-                        <div className="empty-state">
-                          <span style={{ fontSize: '2rem', marginBottom: '1rem' }}>{TAB_CONFIG[activeTab].icon}</span>
-                          <p>{TAB_CONFIG[activeTab].empty}</p>
-                        </div>
-                      ) : (
-                        <div>
-                          {activeItems.map((item) => (
-                            <div
-                              key={item.id}
-                              className={`list-item ${selected && selected.id === item.id ? 'selected' : ''}`}
-                              onClick={() => openDetail(item.id)}
-                            >
-                              <div className="item-main">
-                                <strong>{item.repo_full_name} #{item.pr_number}</strong>
-                                <p>{item.pr_title}</p>
-                                <span className={`badge ${getVerdictBadgeClass(item.verdict)}`} style={{ marginTop: '0.5rem' }}>
-                                  {verdictLabel(item.verdict)}
-                                </span>
-                              </div>
-                              <div className="item-meta">
-                                <small className="item-date">{prettyDate(item.updated_at || item.created_at)}</small>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
+              {/* PR Detail */}
+              <div className="pr-detail-panel">
+                {detailLoading ? (
+                  <div className="loading-overlay">
+                    <div className="spinner"></div>
+                    <p>Loading details...</p>
+                  </div>
+                ) : !selectedPR ? (
+                  <div className="pr-detail-placeholder">
+                    <span className="placeholder-icon">📋</span>
+                    <p>Select a PR from the list to view its analysis details.</p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="pr-detail-header">
+                      <h2>{selectedPR.pr_title}</h2>
+                      <div className="pr-detail-badges">
+                        <span className={`detail-badge ${getVerdictBadgeClass(selectedPR.verdict)}`}>
+                          {getVerdictIcon(selectedPR.verdict)} {(selectedPR.verdict || 'pending').replaceAll('_', ' ')}
+                        </span>
+                        <span className="detail-badge neutral">PR #{selectedPR.pr_number}</span>
+                        <span className="detail-badge neutral">{selectedPR.pr_author}</span>
+                        <span className="detail-badge neutral">{prettyDate(selectedPR.created_at)}</span>
+                        {selectedPR.auto_closed && (
+                          <span className="detail-badge verdict-failed">Auto-Closed</span>
+                        )}
+                      </div>
+                      {selectedPR.pr_url && (
+                        <a
+                          href={selectedPR.pr_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="pr-detail-link"
+                        >
+                          View on GitHub ↗
+                        </a>
                       )}
                     </div>
-                  </div>
 
-                  <aside className="detail-card">
-                    {renderSelectedDetail()}
-                  </aside>
-                </section>
-              </>
-            )}
+                    {selectedPR.analysis && (
+                      <>
+                        {/* Scores */}
+                        <div className="scores-row">
+                          <div className="score-tile">
+                            <div className="score-label">Spam Score</div>
+                            <div className={`score-value ${selectedPR.analysis.spam_score > 50 ? 'danger' : 'success'}`}>
+                              {selectedPR.analysis.spam_score ?? '—'}
+                            </div>
+                          </div>
+                          <div className="score-tile">
+                            <div className="score-label">Quality Score</div>
+                            <div className={`score-value ${(selectedPR.analysis.quality_score || 0) >= 60 ? 'success' : 'warning'}`}>
+                              {selectedPR.analysis.quality_score ?? '—'}
+                            </div>
+                          </div>
+                          <div className="score-tile">
+                            <div className="score-label">Effort Score</div>
+                            <div className={`score-value ${(selectedPR.analysis.effort_score || 0) >= 50 ? 'success' : 'warning'}`}>
+                              {selectedPR.analysis.effort_score ?? '—'}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Verdict Reason */}
+                        {selectedPR.analysis.verdict_reason && (
+                          <div className="analysis-section">
+                            <h4>💬 Verdict Reason</h4>
+                            <p>{selectedPR.analysis.verdict_reason}</p>
+                          </div>
+                        )}
+
+                        {/* Spam Reason */}
+                        {selectedPR.analysis.spam_reason && (
+                          <div className="analysis-section">
+                            <h4>🚫 Spam Reason</h4>
+                            <p>{selectedPR.analysis.spam_reason}</p>
+                          </div>
+                        )}
+
+                        {/* Issue Alignment */}
+                        {selectedPR.analysis.issue_alignment_reason && (
+                          <div className="analysis-section">
+                            <h4>🎯 Issue Alignment</h4>
+                            <p>
+                              {selectedPR.analysis.issue_aligned ? '✓ Aligned' : '✕ Not aligned'}
+                              {selectedPR.analysis.issue_number && ` with issue #${selectedPR.analysis.issue_number}`}
+                              {selectedPR.analysis.issue_alignment_score != null && ` (score: ${selectedPR.analysis.issue_alignment_score})`}
+                              {' — '}
+                              {selectedPR.analysis.issue_alignment_reason}
+                            </p>
+                          </div>
+                        )}
+
+                        {/* Description Match */}
+                        {selectedPR.analysis.description_match_reason && (
+                          <div className="analysis-section">
+                            <h4>📝 Description Match</h4>
+                            <p>
+                              {selectedPR.analysis.description_match ? '✓ Matches' : '✕ Mismatch'}
+                              {selectedPR.analysis.description_match_score != null && ` (score: ${selectedPR.analysis.description_match_score})`}
+                              {' — '}
+                              {selectedPR.analysis.description_match_reason}
+                            </p>
+                          </div>
+                        )}
+
+                        {/* Quality Issues */}
+                        {selectedPR.analysis.quality_issues?.length > 0 && (
+                          <div className="analysis-section">
+                            <h4>⚠️ Quality Issues</h4>
+                            <div className="analysis-tags">
+                              {selectedPR.analysis.quality_issues.map((issue, i) => (
+                                <span key={i} className="analysis-tag">{issue}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Policy Violations */}
+                        {selectedPR.analysis.policy_violations?.length > 0 && (
+                          <div className="analysis-section">
+                            <h4>🛑 Policy Violations</h4>
+                            <div className="analysis-tags">
+                              {selectedPR.analysis.policy_violations.map((v, i) => (
+                                <span key={i} className="analysis-tag policy">{v}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Additional Metrics */}
+                        {(selectedPR.analysis.author_account_age_days != null || selectedPR.analysis.signal_to_noise_ratio != null) && (
+                          <div className="analysis-section">
+                            <h4>📊 Additional Metrics</h4>
+                            <div className="scores-row" style={{ gridTemplateColumns: '1fr 1fr' }}>
+                              {selectedPR.analysis.author_account_age_days != null && (
+                                <div className="score-tile">
+                                  <div className="score-label">Author Age (days)</div>
+                                  <div className="score-value">{selectedPR.analysis.author_account_age_days}</div>
+                                </div>
+                              )}
+                              {selectedPR.analysis.signal_to_noise_ratio != null && (
+                                <div className="score-tile">
+                                  <div className="score-label">Signal/Noise</div>
+                                  <div className="score-value">{selectedPR.analysis.signal_to_noise_ratio}</div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
           </>
         )}
-      </main>
+      </div>
     </div>
   )
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// APP — Page Router
+// ═══════════════════════════════════════════════════════════════════════════
+function App() {
+  // 'connect' | 'repos' | 'dashboard'
+  const [page, setPage] = useState('connect')
+  const [githubLogin, setGithubLogin] = useState('')
+  const [oauthEnabled, setOauthEnabled] = useState(true)
+  const [selectedRepo, setSelectedRepo] = useState(null)
+  const [error, setError] = useState('')
+  const [initialLoading, setInitialLoading] = useState(true)
+
+  // On mount: check for hash credentials, then check setup status
+  useEffect(() => {
+    async function init() {
+      // 1) Try consuming OAuth hash from redirect
+      const creds = consumeHashCredentials()
+      if (creds) {
+        saveAuthCredentials(creds.token, creds.login)
+        setGithubLogin(creds.login)
+        setPage('repos')
+        setInitialLoading(false)
+        return
+      }
+
+      // 2) Try saved credentials
+      const savedToken = getSavedAuthToken()
+      const savedLogin = getSavedGithubLogin()
+      if (savedToken && savedLogin) {
+        // Verify the token is still valid
+        try {
+          const data = await fetchJson('/api/setup/status')
+          setOauthEnabled(data.oauth_enabled !== false)
+          if (data.connected) {
+            setGithubLogin(data.github_login || savedLogin)
+            setPage('repos')
+          } else {
+            // Token invalid, clear
+            clearAuthCredentials()
+            setPage('connect')
+          }
+        } catch {
+          // Backend unreachable; use saved creds anyway
+          setGithubLogin(savedLogin)
+          setPage('repos')
+        }
+        setInitialLoading(false)
+        return
+      }
+
+      // 3) Not connected, check if oauth is enabled
+      try {
+        const data = await fetchJson('/api/setup/status')
+        setOauthEnabled(data.oauth_enabled !== false)
+      } catch {
+        // Backend may be down
+      }
+      setPage('connect')
+      setInitialLoading(false)
+    }
+    init()
+  }, [])
+
+  function handleDisconnect() {
+    clearAuthCredentials()
+    fetchJson('/api/setup/logout', {}, { method: 'POST' }).catch(() => { })
+    setGithubLogin('')
+    setSelectedRepo(null)
+    setPage('connect')
+  }
+
+  function handleSelectRepo(repoFullName) {
+    setSelectedRepo(repoFullName)
+    setPage('dashboard')
+  }
+
+  function handleBackToRepos() {
+    setSelectedRepo(null)
+    setPage('repos')
+  }
+
+  if (initialLoading) {
+    return (
+      <div className="connect-page">
+        <div className="loading-overlay">
+          <div className="spinner"></div>
+          <p style={{ color: 'var(--text-muted)' }}>Loading Sieve...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (page === 'connect') {
+    return <ConnectPage oauthEnabled={oauthEnabled} error={error} onConnect={() => { }} />
+  }
+
+  if (page === 'repos') {
+    return (
+      <ReposPage
+        githubLogin={githubLogin}
+        onSelectRepo={handleSelectRepo}
+        onDisconnect={handleDisconnect}
+      />
+    )
+  }
+
+  if (page === 'dashboard' && selectedRepo) {
+    return (
+      <DashboardPage
+        repoFullName={selectedRepo}
+        onBack={handleBackToRepos}
+        githubLogin={githubLogin}
+      />
+    )
+  }
+
+  return <ConnectPage oauthEnabled={oauthEnabled} error={error} onConnect={() => { }} />
 }
 
 export default App
