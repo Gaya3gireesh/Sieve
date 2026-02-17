@@ -365,11 +365,15 @@ function App() {
           </button>
         ))}
 
-        <div style={{ marginTop: '2rem', padding: '0 1rem' }}>
-          <h4 style={{ fontSize: '0.75rem', color: '#64748b', textTransform: 'uppercase', marginBottom: '0.75rem', letterSpacing: '0.05em', fontWeight: 600 }}>Repositories</h4>
+        <div style={{ marginTop: '2rem', padding: '0 1rem', borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: '1rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+            <h4 style={{ fontSize: '0.75rem', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, margin: 0 }}>Repositories</h4>
+            <button onClick={loadSetupStatus} className="btn-icon" title="Refresh List" style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', fontSize: '0.8rem', padding: 0 }}>↻</button>
+          </div>
+
           {setup.loading ? (
             <div style={{ color: '#94a3b8', fontSize: '0.85rem', fontStyle: 'italic' }}>Loading...</div>
-          ) : setup.connected && Array.isArray(setup.visible_repositories) && setup.visible_repositories.length > 0 ? (
+          ) : Array.isArray(setup.visible_repositories) && setup.visible_repositories.length > 0 ? (
             <div className="repo-list">
               {setup.visible_repositories.slice(0, 15).map((r) => (
                 <button
@@ -385,7 +389,7 @@ function App() {
             </div>
           ) : (
             <div style={{ color: '#64748b', fontSize: '0.85rem' }}>
-              {setup.connected ? 'No active repositories found.' : 'Connect to see repositories.'}
+              {setup.connected ? 'No active repositories found.' : <button onClick={startGithubConnect} className="link-button" style={{ color: '#6366f1', background: 'none', border: 'none', padding: 0, textDecoration: 'underline', cursor: 'pointer' }}>Connect to see repositories</button>}
             </div>
           )}
         </div>
@@ -407,57 +411,50 @@ function App() {
 
   const renderSelectedDetail = () => {
     if (loading.detail) return <div className="loading-overlay"><div className="spinner"></div><p>Loading details...</p></div>
-    if (!selected) return <div className="empty-state"><p>Select a Pull Request to view analysis</p></div>
-
+    if (!selected) return <div className="detail-placeholder">Select an item to view details</div>
+    const isPr = !!selected.pr_number
     return (
-      <div className="detail-content">
-        <div className="detail-header">
-          <h2>{selected.pr_title}</h2>
+      <article className="detail-card">
+        <header className="detail-header">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start' }}>
+            <h2>{isPr ? selected.pr_title : selected.repo_full_name}</h2>
+            <a href={selected.pr_url || `https://github.com/${selected.repo_full_name}`} target="_blank" rel="noreferrer" className="btn btn-secondary btn-sm" style={{ fontSize: '0.8rem' }}>
+              View on GitHub ↗
+            </a>
+          </div>
+
           <div className="detail-meta-row">
             <span className={`badge ${getVerdictBadgeClass(selected.verdict)}`}>
-              {verdictLabel(selected.verdict)}
+              {selected.verdict}
             </span>
-            <span>#{selected.pr_number} in {selected.repo_full_name}</span>
-            <span>by <strong>{selected.pr_author}</strong></span>
-            <a href={selected.pr_url} target="_blank" rel="noreferrer" className="btn btn-ghost" style={{ padding: '0.2rem 0.5rem', fontSize: '0.8rem' }}>View on GitHub ↗</a>
+            {isPr && <span className="badge badge-default">PR #{selected.pr_number}</span>}
+            <span className="badge badge-default">{prettyDate(selected.created_at)}</span>
+            <span className="badge badge-default">{selected.pr_author}</span>
           </div>
-        </div>
+        </header>
 
-        <div className="scores-grid">
-          <div className="score-box">
-            <span>Spam Probability</span>
-            <strong style={{ color: selected.analysis?.spam_score > 0.5 ? '#dc2626' : '#16a34a' }}>
-              {formatPercent(selected.analysis?.spam_score)}
-            </strong>
-          </div>
-          <div className="score-box">
-            <span>Effort Score</span>
-            <strong>{formatPercent(selected.analysis?.effort_score)}</strong>
-          </div>
-        </div>
+        {selected.analysis && (
+          <div className="analysis-content" style={{ marginTop: '2rem' }}>
+            <div className="scores-grid">
+              <div className="score-box">
+                <div style={{ color: '#64748b', fontSize: '0.85rem', marginBottom: '0.5rem' }}>SPAM SCORE</div>
+                <strong style={{ color: selected.analysis.spam_score > 50 ? '#ef4444' : '#10b981' }}>
+                  {selected.analysis.spam_score ?? '—'}
+                </strong>
+              </div>
+              <div className="score-box">
+                <div style={{ color: '#64748b', fontSize: '0.85rem', marginBottom: '0.5rem' }}>QUALITY SCORE</div>
+                <strong>{selected.analysis.quality_score ?? '—'}</strong>
+              </div>
+            </div>
 
-        <div className="analysis-section">
-          <div className="analysis-item">
-            <h4>Analysis Verdict</h4>
-            <p>{selected.analysis?.verdict_reason || 'No detailed reason provided.'}</p>
+            <div className="analysis-item">
+              <h4>Verdict Reason</h4>
+              <p>{selected.analysis.verdict_reason || 'No specific reason provided.'}</p>
+            </div>
           </div>
-
-          <div className="analysis-item">
-            <h4>Issue Alignment</h4>
-            <p>
-              <span className={`badge ${selected.analysis?.issue_aligned ? 'badge-success' : 'badge-warning'}`}>
-                {selected.analysis?.issue_aligned ? 'Aligned' : 'Not Aligned'}
-              </span>
-              {' '} - {selected.analysis?.issue_alignment_reason}
-            </p>
-          </div>
-
-          <div className="analysis-item">
-            <h4>Description Quality</h4>
-            <p>{selected.analysis?.description_match_reason}</p>
-          </div>
-        </div>
-      </div>
+        )}
+      </article>
     )
   }
 
@@ -466,32 +463,32 @@ function App() {
       {renderSidebar()}
 
       <main className="main-content">
-        {/* Header */}
+        {/* Top Header */}
         <header className="top-bar">
           <div className="page-title">
             <h1>Dashboard</h1>
-            <p>Monitor and moderate Pull Requests</p>
+            <p>Overview of your repository security status.</p>
           </div>
 
-          <form onSubmit={applyFilter} className="filter-bar">
+          <div className="filter-bar">
+            <span style={{ padding: '0.5rem', color: '#94a3b8' }}>🔍</span>
             <input
               type="text"
+              placeholder="Filter by repo..."
               className="search-input"
-              placeholder="Filter by repo (owner/repo)..."
               value={filterInput}
-              onChange={(e) => setFilterInput(e.target.value)}
+              onChange={(e) => {
+                setFilterInput(e.target.value)
+                setRepoFilter(e.target.value)
+              }}
             />
-            {repoFilter && (
-              <button type="button" className="btn btn-ghost" onClick={() => { setFilterInput(''); setRepoFilter(''); setSelected(null); }}>Clear</button>
-            )}
-            <button type="submit" className="btn btn-primary">Apply</button>
-          </form>
+          </div>
         </header>
 
-        {/* Global Error Banner */}
         {error && (
-          <div style={{ background: '#fee2e2', color: '#991b1b', padding: '1rem', borderRadius: '0.5rem', marginBottom: '1.5rem', border: '1px solid #fecaca' }}>
+          <div className="alert alert-error" style={{ marginBottom: '1.5rem', padding: '1rem', background: '#fee2e2', color: '#991b1b', borderRadius: '0.5rem', border: '1px solid #fecaca' }}>
             {error}
+            <button onClick={() => setError('')} style={{ float: 'right', background: 'none', border: 'none', cursor: 'pointer', color: 'inherit' }}>✕</button>
           </div>
         )}
 
