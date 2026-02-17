@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
-console.log('API_BASE:', API_BASE, 'VITE_API_BASE env:', import.meta.env.VITE_API_BASE)
+console.log('API_BASE:', API_BASE)
 
 // ── Cross-domain OAuth token helpers ────────────────────────────────────
 function getSavedAuthToken() {
@@ -35,19 +35,22 @@ function consumeHashCredentials() {
 
 const TAB_CONFIG = {
   queue: {
-    label: 'Queue',
+    label: 'Pending Queue',
     endpoint: '/api/prs/queue',
     empty: 'No PRs are currently in analysis queue.',
+    icon: '⏳'
   },
   reviewed: {
-    label: 'Reviewed',
+    label: 'Reviewed & Approved',
     endpoint: '/api/prs/reviewed',
     empty: 'No approved PRs yet.',
+    icon: '✅'
   },
   spam: {
     label: 'Spam / Closed',
     endpoint: '/api/prs/spam-closed',
     empty: 'No spam or auto-closed PRs yet.',
+    icon: '🚫'
   },
 }
 
@@ -73,7 +76,6 @@ async function fetchJson(path, params = {}, options = {}) {
     headers,
   })
 
-  // Read body once and only once
   let bodyText = ''
   try {
     bodyText = await response.text()
@@ -95,10 +97,8 @@ async function fetchJson(path, params = {}, options = {}) {
     throw new Error(message)
   }
 
-  // Parse JSON from the body we already read
   const contentType = response.headers.get('content-type') || ''
   if (!contentType.includes('application/json')) return {}
-
   if (!bodyText) return {}
 
   try {
@@ -113,7 +113,9 @@ function prettyDate(isoString) {
   if (!isoString) return 'Unknown'
   const date = new Date(isoString)
   if (Number.isNaN(date.getTime())) return 'Unknown'
-  return date.toLocaleString()
+  return date.toLocaleString(undefined, {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+  })
 }
 
 function formatPercent(value) {
@@ -127,13 +129,26 @@ function verdictLabel(verdict) {
   return String(verdict || 'unknown').replaceAll('_', ' ')
 }
 
+function getVerdictBadgeClass(verdict) {
+  const v = (verdict || '').toLowerCase()
+  if (v.includes('approve') || v.includes('legit')) return 'badge-success'
+  if (v.includes('spam')) return 'badge-error'
+  if (v.includes('clarification')) return 'badge-warning'
+  return 'badge-default'
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState('queue')
   const [filterInput, setFilterInput] = useState('')
   const [repoFilter, setRepoFilter] = useState('')
   const [stats, setStats] = useState(null)
   const [itemsByTab, setItemsByTab] = useState({ queue: [], reviewed: [], spam: [] })
+
+  // Refined loading states
   const [loading, setLoading] = useState({ stats: true, list: false, detail: false })
+  // Track specific list loading to prevent stale data display
+  const [listLoadingState, setListLoadingState] = useState(false)
+
   const [selected, setSelected] = useState(null)
   const [error, setError] = useState('')
 
@@ -146,12 +161,15 @@ function App() {
     webhook_target: '',
     webhook_target_public: false,
   })
+
+  // Quick run state
   const [quickRepoInput, setQuickRepoInput] = useState('')
   const [syncOpenPrs, setSyncOpenPrs] = useState(true)
   const [quickBusy, setQuickBusy] = useState(false)
   const [quickMessage, setQuickMessage] = useState('')
   const [quickFailures, setQuickFailures] = useState([])
 
+  // Load Setup Status
   async function loadSetupStatus() {
     try {
       const data = await fetchJson('/api/setup/status')
@@ -162,12 +180,11 @@ function App() {
     }
   }
 
-  // ── Consume OAuth hash credentials on first render ──────────────────
+  // Initial Auth Check
   useEffect(() => {
     const creds = consumeHashCredentials()
     if (creds) {
       saveAuthCredentials(creds.token, creds.login)
-      // Immediately update local setup state so UI reflects \"Connected\"
       setSetup((prev) => ({
         ...prev,
         connected: true,
@@ -175,13 +192,12 @@ function App() {
         loading: false,
       }))
     }
-    // Always fetch the authoritative status from the backend.
     loadSetupStatus()
   }, [])
 
+  // Load Stats
   useEffect(() => {
     let cancelled = false
-
     async function loadStats() {
       setLoading((prev) => ({ ...prev, stats: true }))
       try {
@@ -193,47 +209,43 @@ function App() {
         if (cancelled) return
         setError(`Stats error: ${err.message}`)
       } finally {
-        if (!cancelled) {
-          setLoading((prev) => ({ ...prev, stats: false }))
-        }
+        if (!cancelled) setLoading((prev) => ({ ...prev, stats: false }))
       }
     }
-
     loadStats()
-    return () => {
-      cancelled = true
-    }
+    return () => { cancelled = true }
   }, [repoFilter, refreshTick])
 
+  // Load List Data (Queue, Reviewed, Spam)
   useEffect(() => {
     let cancelled = false
-
     async function loadList() {
-      setLoading((prev) => ({ ...prev, list: true }))
+      // Clear selection when tab changes to avoid confusion
+      setSelected(null)
+      // Set precise loading state
+      setListLoadingState(true)
+
       try {
         const config = TAB_CONFIG[activeTab]
         const data = await fetchJson(config.endpoint, { limit: 100, repo_full_name: repoFilter })
         if (cancelled) return
+
         setItemsByTab((prev) => ({ ...prev, [activeTab]: data.items || [] }))
         setError('')
       } catch (err) {
         if (cancelled) return
         setError(`List error: ${err.message}`)
       } finally {
-        if (!cancelled) {
-          setLoading((prev) => ({ ...prev, list: false }))
-        }
+        if (!cancelled) setListLoadingState(false)
       }
     }
-
     loadList()
-    return () => {
-      cancelled = true
-    }
+    return () => { cancelled = true }
   }, [activeTab, repoFilter, refreshTick])
 
   const activeItems = useMemo(() => itemsByTab[activeTab] || [], [itemsByTab, activeTab])
 
+  // Open Detail View
   async function openDetail(scanId) {
     setLoading((prev) => ({ ...prev, detail: true }))
     try {
@@ -247,12 +259,14 @@ function App() {
     }
   }
 
+  // Filter Handling
   function applyFilter(event) {
     event.preventDefault()
     setRepoFilter(filterInput.trim())
     setSelected(null)
   }
 
+  // Auth Actions
   function startGithubConnect() {
     const returnTo = `${window.location.origin}${window.location.pathname}${window.location.search}`
     window.location.href = `${API_BASE}/auth/github/start?next=${encodeURIComponent(returnTo)}`
@@ -273,6 +287,7 @@ function App() {
     }
   }
 
+  // Setup / Run Actions
   async function authorizeAndRun(event) {
     event.preventDefault()
     setQuickMessage('')
@@ -306,228 +321,257 @@ function App() {
   }
 
   const statCards = [
-    { key: 'queue_pending', label: 'Pending Queue' },
-    { key: 'reviewed_approved', label: 'Reviewed / Approved' },
-    { key: 'spam_closed', label: 'Spam / Closed' },
-    { key: 'auto_closed', label: 'Auto Closed' },
-    { key: 'needs_clarification', label: 'Needs Clarification' },
-    { key: 'active_repositories', label: 'Active Repositories' },
+    { key: 'queue_pending', label: 'Pending Review', color: 'text-yellow-600' },
+    { key: 'reviewed_approved', label: 'Approved', color: 'text-green-600' },
+    { key: 'spam_closed', label: 'Spam Detected', color: 'text-red-600' },
+    { key: 'active_repositories', label: 'Active Repos', color: 'text-blue-600' },
   ]
+
+  // Render Helpers
+  const renderSidebar = () => (
+    <aside className="sidebar">
+      <div className="sidebar-header">
+        <span>Sentinel</span>
+      </div>
+      <nav className="sidebar-nav">
+        {Object.entries(TAB_CONFIG).map(([key, tab]) => (
+          <button
+            key={key}
+            className={`nav-item ${activeTab === key ? 'active' : ''}`}
+            onClick={() => setActiveTab(key)}
+          >
+            <span>{tab.icon} {tab.label}</span>
+          </button>
+        ))}
+
+        <div style={{ marginTop: 'auto', paddingTop: '1rem', borderTop: '1px solid #374151' }}>
+          <div className="sidebar-sub-nav">
+            <h4 style={{ fontSize: '0.8rem', color: '#6b7280', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Configuration</h4>
+            {/* Quick setup in sidebar for easy access, or keep in main? Let's keep a simplified status here */}
+            <div style={{ fontSize: '0.85rem' }}>
+              {setup.connected ? (
+                <div style={{ color: '#10b981' }}>● Connected</div>
+              ) : (
+                <button onClick={startGithubConnect} className="btn btn-primary" style={{ width: '100%', fontSize: '0.8rem' }}>Connect GitHub</button>
+              )}
+            </div>
+          </div>
+        </div>
+      </nav>
+      <div className="sidebar-footer">
+        © 2026 Sieve Security
+      </div>
+    </aside>
+  )
+
+  const renderSelectedDetail = () => {
+    if (loading.detail) return <div className="loading-overlay"><div className="spinner"></div><p>Loading details...</p></div>
+    if (!selected) return <div className="empty-state"><p>Select a Pull Request to view analysis</p></div>
+
+    return (
+      <div className="detail-content">
+        <div className="detail-header">
+          <h2>{selected.pr_title}</h2>
+          <div className="detail-meta-row">
+            <span className={`badge ${getVerdictBadgeClass(selected.verdict)}`}>
+              {verdictLabel(selected.verdict)}
+            </span>
+            <span>#{selected.pr_number} in {selected.repo_full_name}</span>
+            <span>by <strong>{selected.pr_author}</strong></span>
+            <a href={selected.pr_url} target="_blank" rel="noreferrer" className="btn btn-ghost" style={{ padding: '0.2rem 0.5rem', fontSize: '0.8rem' }}>View on GitHub ↗</a>
+          </div>
+        </div>
+
+        <div className="scores-grid">
+          <div className="score-box">
+            <span>Spam Probability</span>
+            <strong style={{ color: selected.analysis?.spam_score > 0.5 ? '#dc2626' : '#16a34a' }}>
+              {formatPercent(selected.analysis?.spam_score)}
+            </strong>
+          </div>
+          <div className="score-box">
+            <span>Effort Score</span>
+            <strong>{formatPercent(selected.analysis?.effort_score)}</strong>
+          </div>
+        </div>
+
+        <div className="analysis-section">
+          <div className="analysis-item">
+            <h4>Analysis Verdict</h4>
+            <p>{selected.analysis?.verdict_reason || 'No detailed reason provided.'}</p>
+          </div>
+
+          <div className="analysis-item">
+            <h4>Issue Alignment</h4>
+            <p>
+              <span className={`badge ${selected.analysis?.issue_aligned ? 'badge-success' : 'badge-warning'}`}>
+                {selected.analysis?.issue_aligned ? 'Aligned' : 'Not Aligned'}
+              </span>
+              {' '} - {selected.analysis?.issue_alignment_reason}
+            </p>
+          </div>
+
+          <div className="analysis-item">
+            <h4>Description Quality</h4>
+            <p>{selected.analysis?.description_match_reason}</p>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="app-shell">
-      <header className="page-header">
-        <div>
-          <p className="eyebrow">Sentinel</p>
-          <h1>PR Moderation Dashboard</h1>
-          <p className="subtitle">Monitor queued scans, approved PRs, and spam closures across connected repositories.</p>
-        </div>
-        <form onSubmit={applyFilter} className="filter-form">
-          <label htmlFor="repo-filter">Repository Filter</label>
-          <input
-            id="repo-filter"
-            type="text"
-            placeholder="owner/repo"
-            value={filterInput}
-            onChange={(event) => setFilterInput(event.target.value)}
-          />
-          <div className="filter-actions">
-            <button type="submit">Apply</button>
-            <button
-              type="button"
-              className="ghost"
-              onClick={() => {
-                setFilterInput('')
-                setRepoFilter('')
-                setSelected(null)
-              }}
-            >
-              Clear
-            </button>
+      {renderSidebar()}
+
+      <main className="main-content">
+        {/* Header */}
+        <header className="top-bar">
+          <div className="page-title">
+            <h1>Dashboard</h1>
+            <p>Monitor and moderate Pull Requests</p>
           </div>
-        </form>
-      </header>
 
-      <section className="quick-panel">
-        <div className="quick-head">
-          <h2>Quick Connect and Run</h2>
-          {setup.loading ? (
-            <span className="muted-pill">Checking GitHub session...</span>
-          ) : setup.connected ? (
-            <span className="muted-pill success">Connected as {setup.github_login}</span>
-          ) : (
-            <span className="muted-pill warn">Not connected</span>
-          )}
-        </div>
-
-        {!setup.oauth_enabled ? (
-          <div className="banner error">Set <code>GITHUB_OAUTH_CLIENT_ID</code> and <code>GITHUB_OAUTH_CLIENT_SECRET</code> in backend <code>.env</code>.</div>
-        ) : null}
-
-        {!setup.webhook_target_public ? (
-          <div className="banner error">Webhook URL is not public HTTPS. You can still run one-time scans now; set backend <code>PUBLIC_BASE_URL</code> later for live GitHub webhooks.</div>
-        ) : null}
-
-        <div className="quick-actions">
-          {!setup.connected ? (
-            <button type="button" onClick={startGithubConnect} disabled={!setup.oauth_enabled || quickBusy}>
-              Connect GitHub
-            </button>
-          ) : (
-            <button type="button" className="ghost" onClick={disconnectGithub} disabled={quickBusy}>
-              Disconnect GitHub
-            </button>
-          )}
-          <span className="webhook-path">Webhook target: {setup.webhook_target || 'N/A'}</span>
-        </div>
-
-        <form onSubmit={authorizeAndRun} className="quick-form">
-          <label htmlFor="quick-repos">Repository Names (owner/repo)</label>
-          <textarea
-            id="quick-repos"
-            rows="3"
-            placeholder={'owner/repo-a\nowner/repo-b'}
-            value={quickRepoInput}
-            onChange={(event) => setQuickRepoInput(event.target.value)}
-          />
-          <label className="inline-check">
+          <form onSubmit={applyFilter} className="filter-bar">
             <input
-              type="checkbox"
-              checked={syncOpenPrs}
-              onChange={(event) => setSyncOpenPrs(event.target.checked)}
+              type="text"
+              className="search-input"
+              placeholder="Filter by repo (owner/repo)..."
+              value={filterInput}
+              onChange={(e) => setFilterInput(e.target.value)}
             />
-            Queue existing open PRs immediately
-          </label>
-          <button
-            type="submit"
-            disabled={quickBusy || !setup.connected}
-          >
-            {quickBusy ? 'Running...' : 'Authorize Repositories and Run'}
-          </button>
-        </form>
+            {repoFilter && (
+              <button type="button" className="btn btn-ghost" onClick={() => { setFilterInput(''); setRepoFilter(''); setSelected(null); }}>Clear</button>
+            )}
+            <button type="submit" className="btn btn-primary">Apply</button>
+          </form>
+        </header>
 
-        {quickMessage ? <div className="banner ok">{quickMessage}</div> : null}
-        {quickFailures.length > 0 ? (
-          <div className="failure-list">
-            <strong>Failures</strong>
-            <ul>
-              {quickFailures.slice(0, 5).map((row) => (
-                <li key={row}>{row}</li>
-              ))}
-            </ul>
+        {/* Global Error Banner */}
+        {error && (
+          <div style={{ background: '#fee2e2', color: '#991b1b', padding: '1rem', borderRadius: '0.5rem', marginBottom: '1.5rem', border: '1px solid #fecaca' }}>
+            {error}
           </div>
-        ) : null}
-      </section>
+        )}
 
-      {error ? <div className="banner error">{error}</div> : null}
-
-      <section className="stats-grid">
-        {statCards.map((card) => (
-          <article key={card.key} className="stat-card">
-            <p>{card.label}</p>
-            <strong>{loading.stats ? '...' : stats?.[card.key] ?? 0}</strong>
-          </article>
-        ))}
-      </section>
-
-      <section className="panel">
-        <div className="tabs" role="tablist" aria-label="PR lists">
-          {Object.entries(TAB_CONFIG).map(([key, tab]) => (
-            <button
-              key={key}
-              role="tab"
-              aria-selected={activeTab === key}
-              className={activeTab === key ? 'active' : ''}
-              onClick={() => {
-                setActiveTab(key)
-                setSelected(null)
-              }}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-
-        <div className="content-grid">
-          <div className="list-panel">
-            <div className="list-head">
-              <h2>{TAB_CONFIG[activeTab].label}</h2>
-              <span>{loading.list ? 'Loading...' : `${activeItems.length} results`}</span>
+        {/* Quick Actions (Collapsible or just standard panel) */}
+        {!setup.connected || quickMessage || quickFailures.length > 0 || setup.oauth_enabled === false ? (
+          <section className="quick-panel">
+            <div className="quick-header">
+              <h3>Quick Setup & Actions</h3>
+              {setup.connected ?
+                <span className="badge badge-success">Connected as {setup.github_login}</span> :
+                <span className="badge badge-warning">Not Connected</span>}
             </div>
 
-            {activeItems.length === 0 && !loading.list ? (
-              <div className="empty">{TAB_CONFIG[activeTab].empty}</div>
-            ) : (
-              <div className="list-table">
-                {activeItems.map((item) => (
-                  <button
-                    key={item.id}
-                    className="row"
-                    onClick={() => openDetail(item.id)}
-                  >
-                    <div>
-                      <strong>{item.repo_full_name} #{item.pr_number}</strong>
-                      <p>{item.pr_title}</p>
+            <div className="quick-body">
+              {!setup.connected && (
+                <div style={{ marginBottom: '1rem' }}>
+                  <p style={{ marginBottom: '0.5rem' }}>Connect your GitHub account to start managing repositories.</p>
+                  <button onClick={startGithubConnect} disabled={!setup.oauth_enabled || quickBusy} className="btn btn-primary">Connect with GitHub</button>
+                  {!setup.oauth_enabled && <p style={{ color: 'red', fontSize: '0.85rem', marginTop: '0.5rem' }}>OAuth not configured in backend.</p>}
+                </div>
+              )}
+
+              {setup.connected && (
+                <form onSubmit={authorizeAndRun} className="quick-form-grid">
+                  <div className="form-group">
+                    <label>Add / Scan Repositories (owner/repo per line)</label>
+                    <textarea
+                      className="form-input-area"
+                      rows="2"
+                      placeholder="owner/repo-name"
+                      value={quickRepoInput}
+                      onChange={(e) => setQuickRepoInput(e.target.value)}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.9rem', cursor: 'pointer' }}>
+                      <input type="checkbox" checked={syncOpenPrs} onChange={(e) => setSyncOpenPrs(e.target.checked)} />
+                      Scan open PRs immediately
+                    </label>
+                    <button type="submit" className="btn btn-primary" disabled={quickBusy}>
+                      {quickBusy ? 'Processing...' : 'Authorize & Run Scan'}
+                    </button>
+                    <button type="button" className="btn btn-ghost" onClick={disconnectGithub} disabled={quickBusy}>Disconnect</button>
+                  </div>
+                </form>
+              )}
+
+              {quickMessage && <div className="badge badge-info" style={{ marginTop: '1rem', display: 'block' }}>{quickMessage}</div>}
+              {quickFailures.length > 0 && (
+                <div style={{ marginTop: '1rem', color: '#991b1b', fontSize: '0.9rem' }}>
+                  <strong>Failed to process:</strong>
+                  <ul style={{ paddingLeft: '1.5rem', marginTop: '0.5rem' }}>
+                    {quickFailures.map((f, i) => <li key={i}>{f}</li>)}
+                  </ul>
+                </div>
+              )}
+            </div>
+          </section>
+        ) : null}
+
+        {/* Stats Grid */}
+        <section className="stats-grid">
+          {statCards.map((card) => (
+            <div key={card.key} className="stat-card">
+              <span className="stat-label">{card.label}</span>
+              <span className="stat-value">
+                {loading.stats ? '-' : (stats?.[card.key] ?? 0)}
+              </span>
+            </div>
+          ))}
+        </section>
+
+        {/* Main Content Split */}
+        <section className="content-split">
+          <div className="list-card">
+            <div className="list-header">
+              <h3>{TAB_CONFIG[activeTab].label}</h3>
+              {listLoadingState && <span className="badge badge-default">Refreshing...</span>}
+            </div>
+
+            <div className="list-scroll-area">
+              {listLoadingState ? (
+                <div className="loading-overlay">
+                  <div className="spinner"></div>
+                  <p>Loading...</p>
+                </div>
+              ) : activeItems.length === 0 ? (
+                <div className="empty-state">
+                  <span style={{ fontSize: '2rem', marginBottom: '1rem' }}>{TAB_CONFIG[activeTab].icon}</span>
+                  <p>{TAB_CONFIG[activeTab].empty}</p>
+                </div>
+              ) : (
+                <div>
+                  {activeItems.map((item) => (
+                    <div
+                      key={item.id}
+                      className={`list-item ${selected && selected.id === item.id ? 'selected' : ''}`}
+                      onClick={() => openDetail(item.id)}
+                    >
+                      <div className="item-main">
+                        <strong>{item.repo_full_name} #{item.pr_number}</strong>
+                        <p>{item.pr_title}</p>
+                        <span className={`badge ${getVerdictBadgeClass(item.verdict)}`} style={{ marginTop: '0.5rem' }}>
+                          {verdictLabel(item.verdict)}
+                        </span>
+                      </div>
+                      <div className="item-meta">
+                        <small className="item-date">{prettyDate(item.updated_at || item.created_at)}</small>
+                      </div>
                     </div>
-                    <div className="row-meta">
-                      <span className="pill">{verdictLabel(item.verdict)}</span>
-                      <small>{prettyDate(item.updated_at || item.created_at)}</small>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            )}
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
 
-          <aside className="detail-panel">
-            {loading.detail ? (
-              <p>Loading PR detail...</p>
-            ) : !selected ? (
-              <p>Select a PR to view the Sentinel verdict breakdown.</p>
-            ) : (
-              <>
-                <h3>{selected.repo_full_name} #{selected.pr_number}</h3>
-                <p className="detail-title">{selected.pr_title}</p>
-                <p>
-                  Author: <strong>{selected.pr_author}</strong>
-                </p>
-                <p>
-                  Verdict: <strong>{verdictLabel(selected.verdict)}</strong>
-                </p>
-                <p>
-                  PR Link: <a href={selected.pr_url} target="_blank" rel="noreferrer">Open on GitHub</a>
-                </p>
-
-                <div className="analysis-grid">
-                  <article>
-                    <span>Effort Score</span>
-                    <strong>{formatPercent(selected.analysis?.effort_score)}</strong>
-                  </article>
-                  <article>
-                    <span>Issue Aligned</span>
-                    <strong>{selected.analysis?.issue_aligned === null || selected.analysis?.issue_aligned === undefined ? 'N/A' : selected.analysis.issue_aligned ? 'Yes' : 'No'}</strong>
-                  </article>
-                  <article>
-                    <span>Description Match</span>
-                    <strong>{selected.analysis?.description_match === null || selected.analysis?.description_match === undefined ? 'N/A' : selected.analysis.description_match ? 'Yes' : 'No'}</strong>
-                  </article>
-                  <article>
-                    <span>Spam Score</span>
-                    <strong>{formatPercent(selected.analysis?.spam_score)}</strong>
-                  </article>
-                </div>
-
-                <div className="analysis-notes">
-                  <p><strong>Verdict Reason:</strong> {selected.analysis?.verdict_reason || 'None'}</p>
-                  <p><strong>Spam Reason:</strong> {selected.analysis?.spam_reason || 'None'}</p>
-                  <p><strong>Issue Alignment Reason:</strong> {selected.analysis?.issue_alignment_reason || 'None'}</p>
-                  <p><strong>Description Match Reason:</strong> {selected.analysis?.description_match_reason || 'None'}</p>
-                </div>
-              </>
-            )}
+          <aside className="detail-card">
+            {renderSelectedDetail()}
           </aside>
-        </div>
-      </section>
+        </section>
+      </main>
     </div>
   )
 }
