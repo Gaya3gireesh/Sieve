@@ -160,6 +160,7 @@ function App() {
     github_login: null,
     webhook_target: '',
     webhook_target_public: false,
+    visible_repositories: [],
   })
 
   // Quick run state
@@ -331,8 +332,28 @@ function App() {
   const renderSidebar = () => (
     <aside className="sidebar">
       <div className="sidebar-header">
-        <span>Sentinel</span>
+        <span className="brand-logo">🛡️</span>
+        <span className="brand-name">Sentinel</span>
       </div>
+
+      <div className="user-profile-section">
+        {setup.connected ? (
+          <div className="user-card">
+            <div className="user-avatar-placeholder">{setup.github_login.charAt(0).toUpperCase()}</div>
+            <div className="user-info">
+              <span className="user-name">{setup.github_login}</span>
+              <span className="user-status">● Connected</span>
+            </div>
+          </div>
+        ) : (
+          <div className="user-card disconnected">
+            <div className="user-info">
+              <span className="user-status">○ Guest</span>
+            </div>
+          </div>
+        )}
+      </div>
+
       <nav className="sidebar-nav">
         {Object.entries(TAB_CONFIG).map(([key, tab]) => (
           <button
@@ -344,22 +365,42 @@ function App() {
           </button>
         ))}
 
-        <div style={{ marginTop: 'auto', paddingTop: '1rem', borderTop: '1px solid #374151' }}>
-          <div className="sidebar-sub-nav">
-            <h4 style={{ fontSize: '0.8rem', color: '#6b7280', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Configuration</h4>
-            {/* Quick setup in sidebar for easy access, or keep in main? Let's keep a simplified status here */}
-            <div style={{ fontSize: '0.85rem' }}>
-              {setup.connected ? (
-                <div style={{ color: '#10b981' }}>● Connected</div>
-              ) : (
-                <button onClick={startGithubConnect} className="btn btn-primary" style={{ width: '100%', fontSize: '0.8rem' }}>Connect GitHub</button>
-              )}
+        <div style={{ marginTop: '2rem', padding: '0 1rem' }}>
+          <h4 style={{ fontSize: '0.75rem', color: '#64748b', textTransform: 'uppercase', marginBottom: '0.75rem', letterSpacing: '0.05em', fontWeight: 600 }}>Repositories</h4>
+          {setup.loading ? (
+            <div style={{ color: '#94a3b8', fontSize: '0.85rem', fontStyle: 'italic' }}>Loading...</div>
+          ) : setup.connected && Array.isArray(setup.visible_repositories) && setup.visible_repositories.length > 0 ? (
+            <div className="repo-list">
+              {setup.visible_repositories.slice(0, 15).map((r) => (
+                <button
+                  key={r.full_name}
+                  className="repo-item"
+                  onClick={() => { setRepoFilter(r.full_name); setFilterInput(r.full_name); setActiveTab('queue'); setSelected(null); }}
+                  title={r.full_name}
+                >
+                  <span className="repo-name">{r.full_name.split('/')[1]}</span>
+                </button>
+              ))}
+              {setup.visible_repositories.length > 15 && <div style={{ fontSize: '0.75rem', color: '#64748b', padding: '0.5rem' }}>+ {setup.visible_repositories.length - 15} more</div>}
             </div>
-          </div>
+          ) : (
+            <div style={{ color: '#64748b', fontSize: '0.85rem' }}>
+              {setup.connected ? 'No active repositories found.' : 'Connect to see repositories.'}
+            </div>
+          )}
         </div>
       </nav>
       <div className="sidebar-footer">
-        © 2026 Sieve Security
+        {setup.connected ? (
+          <button onClick={disconnectGithub} className="btn btn-outline-danger full-width" disabled={quickBusy}>
+            Disconnect GitHub
+          </button>
+        ) : (
+          <button onClick={startGithubConnect} className="btn btn-primary full-width">
+            Connect GitHub
+          </button>
+        )}
+        <div className="footer-copy">© 2026 Sieve Security</div>
       </div>
     </aside>
   )
@@ -514,12 +555,16 @@ function App() {
         {/* Stats Grid */}
         <section className="stats-grid">
           {statCards.map((card) => (
-            <div key={card.key} className="stat-card">
-              <span className="stat-label">{card.label}</span>
-              <span className="stat-value">
-                {loading.stats ? '-' : (stats?.[card.key] ?? 0)}
-              </span>
-            </div>
+            <article key={card.key} className="stat-card">
+              <p className="stat-label">{card.label}</p>
+              <strong className="stat-value">
+                {loading.stats ? (
+                  <span className="skeleton-text" style={{ display: 'inline-block', width: '2rem', height: '1.5rem', background: '#e2e8f0', borderRadius: '0.25rem' }}></span>
+                ) : (
+                  stats?.[card.key] ?? 0
+                )}
+              </strong>
+            </article>
           ))}
         </section>
 
