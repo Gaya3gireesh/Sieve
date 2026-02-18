@@ -79,9 +79,13 @@ s
 
 List the key features of your project:
 - PR Pre-screening: Auto-analyzes incoming PRs for relevance and quality.
-- Effort-to-Noise Scoring: Produces a single score combining heuristics and LLM signals.
-- Auto Actions: Auto-labels, comments, or closes low-effort PRs with explanations.
 - Async Pipeline & Integrations: Celery workers + GitHub webhooks, Redis, Postgres for scalable processing.
+- AI-Powered Spam Detection:Sends PR metadata (author, account age, body) to Groq Llama-3-70b to detect spam/slop.
+- Effort-to-Noise Analysis:Calculates "Signal Score" (SNR) by distinguishing logic lines from noise (whitespace, comments, docs) using regex.
+- Semantic Issue Alignment:Checks if PR changes address the linked issue.
+-  Intent Verification:Verifies if the PR description matches the actual code changes.
+- Automated Governance (PushbackBot):Automatically comments on PRs for vague descriptions, spam, or policy violations. Can close PRs marked as spam.
+- Maintainer Dashboard:Full React UI for viewing PR queues, stats, and individual analysis details.
 ---
 
 ## Implementation
