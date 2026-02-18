@@ -182,16 +182,16 @@ Use `curl` or the frontend UI to exercise the system during development.
 
 #### Screenshots (Add at least 3)
 
-![img1](screenshots/img1.jpeg)
+![img1](img1.jpeg)
 *Caption: PR closed by Sieve*
 
-![img2](screenshots/img2.jpeg)
+![img2](img2.jpeg)
 *Caption: Repository list*
 
-![img3](screenshots/img3.jpeg)
+![img3](img3.jpeg)
 *Caption: repository dashboard*
 
-![img4](screenshots/img4.jpeg)
+![img4](img4.jpeg)
 *Caption: Details of a closed spam PR*
 
 
