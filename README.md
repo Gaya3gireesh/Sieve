@@ -183,13 +183,17 @@ Use `curl` or the frontend UI to exercise the system during development.
 #### Screenshots (Add at least 3)
 
 ![img1](screenshots/img1.png)
-*Caption: Main dashboard showing PR scan results and overall Effort-to-Noise scoring.*
+*Caption: PR closed by Sieve*
 
 ![img2](screenshots/img2.png)
-*Caption: Pull request detail view with inline analysis and suggested actions.*
+*Caption: Repository list*
 
 ![img3](screenshots/img3.png)
-*Caption: Maintainer review dashboard highlighting auto-labeled and closed PRs.*
+*Caption: repository dashboard*
+
+![img4](screenshots/img4.png)
+*Caption: Details of a closed spam PR*
+
 
 #### Diagrams
 
